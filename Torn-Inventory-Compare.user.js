@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn-Inventory-Compare
 // @namespace    https://github.com/ShavedW00kie/
-// @version      1.0.4
+// @version      1.0.5
 // @description  Compare individual inventory weapon and armor stats with the equipped or chosen item in the same slot. Includes temporary effects, coverage, settings and diagnostics.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -43,7 +43,7 @@
     "use strict";
 
     const MyDebug = initializeModularDebugger(GM_info.script.name);
-    const VERSION = "1.0.4";
+    const VERSION = "1.0.5";
     const P = "tw-ic-";
     if (document.getElementById(P + "active")) return;
     const marker = document.createElement("meta");
@@ -66,7 +66,8 @@
     const ITEM_MARKERS = ITEM_ATTRS.map(a => "[" + a + "]").join(",");
     const IDENTITY_MARKERS = [...ITEM_ATTRS, ...UID_ATTRS].map(a => "[" + a + "]").join(",");
     const NATIVE_LISTS = "ul.items-cont,ol.items-cont,ul[id$='-items'],ol[id$='-items'],#all-items";
-    const ROWS = ITEM_MARKERS + ",.items-cont > li,#all-items > li";
+    const NATIVE_ROWS = NATIVE_LISTS.split(",").map(selector => selector + " > li").join(",");
+    const ROWS = ITEM_MARKERS + "," + NATIVE_ROWS;
     const state = {
         opts: { ...DEFAULTS }, key: "", epoch: 0, queue: Promise.resolve(), writes: Promise.resolve(),
         catalogs: new Map(), details: new Map(), inventories: new Map(), equipment: [],
@@ -341,12 +342,26 @@
         for (const attr of ITEM_ATTRS) { const id = uidOf(node.getAttribute(attr)); if (id) return id; }
         return "";
     }
+    function hasItemTitle(row) {
+        // A genuine nested copy has its own item title. Repeated IDs on Send,
+        // Equip and Sell list entries do not make those controls item rows.
+        return Boolean(row.querySelector(":scope > .title-wrap .name-wrap, :scope > .name-wrap, :scope > .name, :scope > [data-item-name]"));
+    }
     function inventoryRow(node) {
         if (!(node instanceof Element) || owned(node)) return null;
-        // Item identity is also repeated on Send/Equip/etc. controls. Those
-        // elements describe a copy but are never independent inventory rows.
-        const li = node.closest("li");
-        if (li && (li.matches(ITEM_MARKERS) || li.parentElement?.matches(NATIVE_LISTS) || li.querySelector(":scope > .title-wrap"))) return li;
+        // The native boundary is the direct LI child of the inventory category,
+        // not the nearest LI. Torn's item actions themselves are nested LIs.
+        const nativeRow = node.closest(NATIVE_ROWS);
+        if (nativeRow && (!state.root || state.root.contains(nativeRow)) && hasItemTitle(nativeRow)) return nativeRow;
+        let fallback = null;
+        for (let li = node.closest("li"); li && li !== state.root && (!state.root || state.root.contains(li)); li = li.parentElement?.closest("li")) {
+            if (hasItemTitle(li)) return li;
+            if (li === nativeRow) return li;
+            // For other list layouts, the outer item-bearing LI owns nested
+            // controls. A real separate copy with a title returned above.
+            if (li.matches(ITEM_MARKERS)) fallback = li;
+        }
+        if (fallback) return fallback;
         // Card-style layouts without a list item: use the outer item container,
         // excluding native interactive controls and inventory category roots.
         let candidate = node.closest(ITEM_MARKERS), row = null;
@@ -382,7 +397,7 @@
     }
     function inventoryCategory(group) { return Object.keys(SLOT_AREA).includes(group) ? "Defensive" : group; }
     function rowHost(row, model) {
-        if (getComputedStyle(row).display !== "table-row") return row;
+        if (!["table-row", "table", "inline-table"].includes(getComputedStyle(row).display)) return row;
         const candidates = Array.from(row.querySelectorAll(".name-wrap,.name,.desc,[data-item-name],td,th,div,span"));
         let cell = candidates.find(n => !owned(n) && getComputedStyle(n).display === "table-cell" && clean(n.textContent).includes(model.name));
         if (!cell) cell = candidates.find(n => !owned(n) && /^(?:name|name-wrap|desc)$/.test(n.className) && clean(n.textContent).includes(model.name));
@@ -547,8 +562,8 @@
         const candidates = Array.from(state.root.querySelectorAll(ROWS)).filter(n => !owned(n));
         state.rowCandidates = candidates.length;
         const rows = new Set(candidates.map(inventoryRow).filter(row => row && state.root.contains(row)));
-        // A nested list can contain genuine separate copies. Exclude only
-        // their group wrapper, not rows that merely contain item action IDs.
+        // Only resolved item owners participate here. Nested action LIs have
+        // already mapped to their parent item, so they cannot discard it.
         const groups = new Set();
         for (const row of rows) {
             for (let p = row.parentElement; p && p !== state.root; p = p.parentElement) if (rows.has(p)) groups.add(p);
@@ -801,32 +816,51 @@
             return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
         };
         const rows = state.rows.filter(m => m.row.isConnected && m.row.getClientRects().length);
-        const samples = []; let outside = 0, duplicates = 0, missing = 0;
+        const inventoryRect = state.root?.getBoundingClientRect();
+        const horizontalOutside = (r, boundary) => Boolean(r && boundary && (r.left < boundary.left - 2 || r.right > boundary.right + 2));
+        const samples = []; let outside = 0, outsideInventory = 0, duplicates = 0, missing = 0, wrongOwner = 0, squeezed = 0;
         for (const model of rows) {
             const widgets = Array.from(model.row.querySelectorAll("." + P + "chip"));
             const eligible = model.group || catalogEntry(model.id)?.type === "Armor";
             if (!widgets.length && eligible && state.opts.enabled) missing++;
             if (widgets.length > 1) duplicates++;
             const chip = widgets[0], rowRect = model.row.getBoundingClientRect(), r = chip?.getBoundingClientRect();
-            const bad = Boolean(r && (r.left < rowRect.left - 2 || r.right > rowRect.right + 2 || r.top < rowRect.top - 2 || r.bottom > rowRect.bottom + 2));
+            const category = model.row.closest(NATIVE_LISTS);
+            const nativeOwner = model.row.closest(NATIVE_ROWS);
+            const expectedOwner = inventoryRow(model.row);
+            const misplaced = Boolean(chip && (expectedOwner !== model.row ||
+                (nativeOwner && nativeOwner !== model.row && !hasItemTitle(model.row)) ||
+                chip.parentElement.parentElement !== rowHost(model.row, model)));
+            const narrow = Boolean(r && r.width < 24);
+            const beyondInventory = horizontalOutside(r, inventoryRect) || horizontalOutside(r, category?.getBoundingClientRect());
+            const beyondRow = Boolean(r && (horizontalOutside(r, rowRect) || r.top < rowRect.top - 2 || r.bottom > rowRect.bottom + 2));
+            const bad = beyondRow || beyondInventory;
             if (bad) outside++;
-            if (samples.length < 3 || (bad && samples.length < 8)) samples.push({
+            if (beyondInventory) outsideInventory++;
+            if (misplaced) wrongOwner++;
+            if (narrow) squeezed++;
+            if (samples.length < 3 || ((bad || misplaced || narrow) && samples.length < 8)) samples.push({
                 rowTag: model.row.tagName.toLowerCase(), itemId: model.id, hasUid: Boolean(model.uid),
                 mountTag: chip?.parentElement.parentElement.tagName.toLowerCase() || null,
-                rowDisplay: getComputedStyle(model.row).display, rowBox: box(model.row), widgetBox: box(chip), widgets: widgets.length, outside: bad
+                rowDisplay: getComputedStyle(model.row).display, rowBox: box(model.row), widgetBox: box(chip),
+                categoryBox: box(category), nativeOwnerBox: box(nativeOwner), widgets: widgets.length,
+                outside: bad, outsideInventory: beyondInventory, wrongOwner: misplaced, squeezed: narrow
             });
         }
-        return { version: VERSION, identityNodes: state.rowCandidates, itemRows: rows.length, outside, duplicates, missing, samples };
+        return { version: VERSION, identityNodes: state.rowCandidates, itemRows: rows.length,
+            inventoryBox: box(state.root), outside, outsideInventory, wrongOwner, squeezed, duplicates, missing, samples };
     }
     function checkLayoutSoon() {
         if (state.layoutFrame) return;
         state.layoutFrame = requestAnimationFrame(() => {
             state.layoutFrame = 0;
             const report = layoutSnapshot();
-            const sig = JSON.stringify([report.itemRows, report.outside, report.duplicates, report.missing]);
+            const sig = JSON.stringify([report.itemRows, report.outside, report.outsideInventory, report.wrongOwner, report.squeezed, report.duplicates, report.missing]);
             if (sig === state.lastLayout) return;
             state.lastLayout = sig;
-            log("Layout check", { rows: report.itemRows, outside: report.outside, duplicates: report.duplicates, missing: report.missing }, report.outside || report.duplicates ? "WARN" : "INFO");
+            log("Layout check", { rows: report.itemRows, outside: report.outside, outsideInventory: report.outsideInventory,
+                wrongOwner: report.wrongOwner, squeezed: report.squeezed, duplicates: report.duplicates, missing: report.missing },
+                report.outside || report.wrongOwner || report.squeezed || report.duplicates || report.missing ? "WARN" : "INFO");
         });
     }
 
@@ -3111,4 +3145,4 @@ function initializeModularDebugger(scriptNamespace) {
 // END SUPPLIED DEBUGGER MODULE
 
     void boot().catch(error => MyDebug.log({ event: "Startup failed", message: error.message }, "ERROR"));
-})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.0.4" } });
+})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.0.5" } });
