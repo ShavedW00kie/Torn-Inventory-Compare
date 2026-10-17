@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn-Inventory-Compare
 // @namespace    https://github.com/ShavedW00kie/
-// @version      1.0.3
+// @version      1.0.4
 // @description  Compare individual inventory weapon and armor stats with the equipped or chosen item in the same slot. Includes temporary effects, coverage, settings and diagnostics.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -43,7 +43,7 @@
     "use strict";
 
     const MyDebug = initializeModularDebugger(GM_info.script.name);
-    const VERSION = "1.0.3";
+    const VERSION = "1.0.4";
     const P = "tw-ic-";
     if (document.getElementById(P + "active")) return;
     const marker = document.createElement("meta");
@@ -61,7 +61,12 @@
     const SLOT_AREA = { head: "Head", body: "Chest", hands: "Hand", legs: "Leg", feet: "Foot", fullbody: "Full Body" };
     const AREAS = ["Full Body", "Head", "Throat", "Heart", "Chest", "Stomach", "Arm", "Hand", "Groin", "Leg", "Foot"];
     const AREA_SHORT = { "Full Body": "All", Head: "Hd", Throat: "Th", Heart: "Ht", Chest: "Ch", Stomach: "St", Arm: "Ar", Hand: "Ha", Groin: "Gr", Leg: "Le", Foot: "Ft" };
-    const ROWS = 'li[data-item],li[data-itemid],[data-uid][data-item-id],[data-armoryid][data-item]';
+    const ITEM_ATTRS = ["data-item", "data-itemid", "data-item-id"];
+    const UID_ATTRS = ["data-armoryid", "data-armouryid", "data-armory", "data-armoury", "data-uid"];
+    const ITEM_MARKERS = ITEM_ATTRS.map(a => "[" + a + "]").join(",");
+    const IDENTITY_MARKERS = [...ITEM_ATTRS, ...UID_ATTRS].map(a => "[" + a + "]").join(",");
+    const NATIVE_LISTS = "ul.items-cont,ol.items-cont,ul[id$='-items'],ol[id$='-items'],#all-items";
+    const ROWS = ITEM_MARKERS + ",.items-cont > li,#all-items > li";
     const state = {
         opts: { ...DEFAULTS }, key: "", epoch: 0, queue: Promise.resolve(), writes: Promise.resolve(),
         catalogs: new Map(), details: new Map(), inventories: new Map(), equipment: [],
@@ -71,7 +76,8 @@
         discovery: null, inventoryObserver: null, frame: 0, hydrating: false, again: false,
         blocked: "", blockedUntil: 0, failures: new Map(), catalogAttempts: new Map(),
         progress: "", notice: "", autoOpened: false, alive: true, requestAbort: new AbortController(),
-        previousFocus: null, scanned: 0, loaded: 0, lastReferences: "", fallbackStorage: false
+        previousFocus: null, scanned: 0, loaded: 0, lastReferences: "", fallbackStorage: false,
+        rowCandidates: 0, lastRowResolution: "", lastLayout: "", layoutFrame: 0
     };
 
     const number = value => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
@@ -331,19 +337,39 @@
             return ["title", "aria-label", "data-tooltip"].some(attr => /^(?:(?:click|tap)\s+(?:here\s+)?to\s+)?unequip\b/i.test(clean(control.getAttribute(attr))));
         });
     }
-    function readRow(row) {
-        const id = uidOf(row.getAttribute("data-item") || row.getAttribute("data-itemid") || row.getAttribute("data-item-id"));
-        if (!id) return null;
-        let uid = "";
-        const attrs = ["data-armoryid", "data-armouryid", "data-armory", "data-armoury", "data-uid"];
-        const identityNode = row.querySelector(attrs.map(a => "[" + a + "]").join(","));
-        for (const node of [row, identityNode]) {
-            if (!node) continue;
-            for (const a of attrs) { uid = uidOf(node.getAttribute(a)); if (uid) break; }
-            if (uid) break;
+    function itemId(node) {
+        for (const attr of ITEM_ATTRS) { const id = uidOf(node.getAttribute(attr)); if (id) return id; }
+        return "";
+    }
+    function inventoryRow(node) {
+        if (!(node instanceof Element) || owned(node)) return null;
+        // Item identity is also repeated on Send/Equip/etc. controls. Those
+        // elements describe a copy but are never independent inventory rows.
+        const li = node.closest("li");
+        if (li && (li.matches(ITEM_MARKERS) || li.parentElement?.matches(NATIVE_LISTS) || li.querySelector(":scope > .title-wrap"))) return li;
+        // Card-style layouts without a list item: use the outer item container,
+        // excluding native interactive controls and inventory category roots.
+        let candidate = node.closest(ITEM_MARKERS), row = null;
+        while (candidate && candidate !== state.root && (!state.root || state.root.contains(candidate))) {
+            if (!candidate.matches("a,button,input,select,option,label,[role=button]")) row = candidate;
+            candidate = candidate.parentElement?.closest(ITEM_MARKERS);
         }
+        return row;
+    }
+    function readRow(row) {
+        const nodes = Array.from(row.querySelectorAll(IDENTITY_MARKERS)).filter(n => !owned(n) && inventoryRow(n) === row);
+        const ids = new Set(nodes.map(itemId).filter(Boolean));
+        const id = itemId(row) || (ids.size === 1 ? [...ids][0] : "");
+        if (!id) return null;
+        const uids = new Set();
+        for (const node of [row, ...nodes]) {
+            if (itemId(node) && itemId(node) !== id) continue;
+            for (const attr of UID_ATTRS) { const value = uidOf(node.getAttribute(attr)); if (value) uids.add(value); }
+        }
+        // Conflicting copy IDs are unavailable, never arbitrarily first-match.
+        let uid = uids.size === 1 ? [...uids][0] : "";
         const weak = uidOf(row.getAttribute("data-id"));
-        if (!uid && weak) {
+        if (!uid && weak && !uids.size) {
             // data-id is used for several purposes. Accept only a matching inventory UID.
             for (const inv of state.inventories.values()) {
                 if (inv.items.some(i => uidOf(i.uid) === weak && String(i.id) === id)) { uid = weak; break; }
@@ -373,8 +399,10 @@
     }
     function releaseRow(row, wrap) {
         if (wrap) wrap.remove();
-        row.classList.remove(P + "annotated");
-        row.removeAttribute("data-tw-ic-mount");
+        else row.querySelectorAll("." + P + "wrap").forEach(n => n.remove());
+        if (row.classList.contains(P + "annotated")) row.classList.remove(P + "annotated");
+        if (row.hasAttribute("data-tw-ic-mount")) row.removeAttribute("data-tw-ic-mount");
+        state.rowModels.delete(row);
     }
     function findRoot() { return document.querySelector("div.items-wrap,.items-wrap,#all-items"); }
     function owned(node) { const e = node && (node.nodeType === 1 ? node : node.parentElement); return Boolean(e && e.closest && e.closest("[data-tw-ic-owned]")); }
@@ -388,10 +416,11 @@
         state.root = root;
         if (!root) return;
         state.inventoryObserver = new MutationObserver(records => {
-            if (records.some(m => !owned(m.target) && (m.type !== "childList" || [...m.addedNodes, ...m.removedNodes].some(n => !owned(n))))) schedule();
+            if (records.some(m => !owned(m.target) && (m.type !== "childList" || [...m.addedNodes, ...m.removedNodes].some(n => !owned(n)) ||
+                [...m.removedNodes].some(n => n.nodeType === 1 && n.matches("." + P + "wrap"))))) schedule();
         });
         state.inventoryObserver.observe(root, { childList: true, subtree: true, attributes: true, characterData: true,
-            attributeFilter: ["class", "data-equipped", "data-id", "data-uid", "data-item", "data-itemid", "data-armoryid", "data-armoury", "hidden", "aria-selected"] });
+            attributeFilter: ["class", "data-equipped", "data-id", ...ITEM_ATTRS, ...UID_ATTRS, "hidden", "aria-selected", "title", "aria-label", "data-action", "data-tooltip"] });
         log("Inventory container found", { selector: root.id ? "#" + root.id : ".items-wrap" });
     }
     function references(models) {
@@ -405,13 +434,13 @@
                 if (models.some(m => m.group === group)) state.pins.delete(group);
             }
             if (state.opts.referenceMode === "selected") continue;
-            const marked = models.filter(m => m.group === group && m.equipped);
+            const marked = [...new Map(models.filter(m => m.group === group && m.equipped).map(m => [m.uid ? m.id + ":" + m.uid : m.row, m])).values()];
             if (marked.length === 1) { result.set(group, { ...marked[0], referenceSource: "Equipped on page" }); continue; }
             if (marked.length > 1) continue;
             const equipped = state.equipment.filter(raw => groupOf(catalogEntry(raw.id)) === group);
             if (equipped.length === 1) {
                 const raw = equipped[0];
-                const sameVisible = models.find(m => m.uid && m.uid === uidOf(raw.uid));
+                const sameVisible = models.find(m => m.uid && m.uid === uidOf(raw.uid) && m.id === String(raw.id));
                 // Explicit current page state wins over the API's service cache.
                 if (sameVisible && ["false", "0"].includes(sameVisible.row.getAttribute("data-equipped"))) continue;
                 result.set(group, { id: String(raw.id), uid: uidOf(raw.uid), name: raw.name, group, referenceSource: "Equipped via API" });
@@ -515,8 +544,16 @@
     }
     function currentModels() {
         if (!state.root) return [];
-        return Array.from(state.root.querySelectorAll(ROWS))
-            .filter(row => !owned(row) && !row.querySelector(ROWS) && row.getClientRects().length > 0)
+        const candidates = Array.from(state.root.querySelectorAll(ROWS)).filter(n => !owned(n));
+        state.rowCandidates = candidates.length;
+        const rows = new Set(candidates.map(inventoryRow).filter(row => row && state.root.contains(row)));
+        // A nested list can contain genuine separate copies. Exclude only
+        // their group wrapper, not rows that merely contain item action IDs.
+        const groups = new Set();
+        for (const row of rows) {
+            for (let p = row.parentElement; p && p !== state.root; p = p.parentElement) if (rows.has(p)) groups.add(p);
+        }
+        return [...rows].filter(row => !groups.has(row) && row.getClientRects().length > 0 && getComputedStyle(row).visibility !== "hidden")
             .map(readRow).filter(Boolean);
     }
     async function hydrate() {
@@ -686,7 +723,9 @@
         return node;
     }
     function renderRow(model, ref) {
-        const row = model.row; let wrap = Array.from(row.querySelectorAll("." + P + "wrap")).find(n => n.closest(ROWS) === row);
+        const row = model.row;
+        const wraps = Array.from(row.querySelectorAll("." + P + "wrap")).filter(n => inventoryRow(n.parentElement) === row);
+        let wrap = wraps.shift(); wraps.forEach(n => n.remove());
         const cat = catalogEntry(model.id);
         if ((!model.group && !(cat && cat.type === "Armor")) || !state.opts.enabled) { releaseRow(row, wrap); return; }
         const actual = statsFor(model); const base = ref && statsFor(ref);
@@ -696,8 +735,8 @@
             wrap = el("div", null, P + "wrap"); wrap.setAttribute("data-tw-ic-owned", "row");
         }
         prepareRow(row, model, wrap);
-        if (state.rowModels.has(row) && wrap.getAttribute("data-signature") === sig) { state.rowModels.set(row, model); return; }
-        wrap.setAttribute("data-signature", sig); wrap.replaceChildren(); state.rowModels.set(row, model);
+        if (state.rowModels.get(row)?.widget === wrap && wrap.querySelector("." + P + "chip") && wrap.getAttribute("data-signature") === sig) { state.rowModels.set(row, { widget: wrap, model }); return; }
+        wrap.setAttribute("data-signature", sig); wrap.replaceChildren(); state.rowModels.set(row, { widget: wrap, model });
         const chip = button("", () => openDetails(model, ref), P + "chip");
         const line = el("span", null, P + "line"); const baseline = sameItem(model, ref);
         if (model.group === "Temporary") {
@@ -727,6 +766,8 @@
         if (!state.alive || !document.body) return;
         styles(); attachRoot(findRoot()); ensureToolbar();
         const models = currentModels(); state.rows = models;
+        const liveRows = new Set(models.map(m => m.row));
+        if (state.root) for (const row of state.root.querySelectorAll("." + P + "annotated")) if (!liveRows.has(row)) releaseRow(row);
         const refs = references(models);
         const groups = [...new Set(models.map(m => m.group).filter(Boolean))];
         const labels = groups.map(g => refs.has(g) ? (groups.length > 1 ? g + ": " : "") + refs.get(g).name : g + ": choose reference");
@@ -738,9 +779,55 @@
             state.loaded + "/" + state.scanned + " items have stats · ↑ higher · ↓ lower · = equal · tap stats for details";
         if (state.statusText.textContent !== info) state.statusText.textContent = info;
         for (const m of models) renderRow(m, refs.get(m.group));
-        if (title !== state.lastReferences) { state.lastReferences = title; log("Comparison references", { groups: groups.length, rows: models.length }); }
+        const resolution = JSON.stringify([state.rowCandidates, models.length, models.filter(m => m.uid).length]);
+        if (resolution !== state.lastRowResolution) {
+            state.lastRowResolution = resolution;
+            log("Inventory rows resolved", { identityNodes: state.rowCandidates, itemRows: models.length, rowsWithUid: models.filter(m => m.uid).length });
+        }
+        const refSignature = JSON.stringify([title, models.length, [...refs].map(([g, r]) => [g, r.id, r.uid, r.referenceSource])]);
+        if (refSignature !== state.lastReferences) {
+            state.lastReferences = refSignature;
+            log("Comparison references", { categories: groups.length, resolved: groups.filter(g => refs.has(g)).length, rows: models.length });
+        }
+        checkLayoutSoon();
         if (needsHydration(models)) void hydrate();
         if (!state.key && !state.autoOpened) { state.autoOpened = true; openSettings(); }
+    }
+
+    function layoutSnapshot() {
+        const box = node => {
+            if (!node) return null;
+            const r = node.getBoundingClientRect();
+            return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
+        };
+        const rows = state.rows.filter(m => m.row.isConnected && m.row.getClientRects().length);
+        const samples = []; let outside = 0, duplicates = 0, missing = 0;
+        for (const model of rows) {
+            const widgets = Array.from(model.row.querySelectorAll("." + P + "chip"));
+            const eligible = model.group || catalogEntry(model.id)?.type === "Armor";
+            if (!widgets.length && eligible && state.opts.enabled) missing++;
+            if (widgets.length > 1) duplicates++;
+            const chip = widgets[0], rowRect = model.row.getBoundingClientRect(), r = chip?.getBoundingClientRect();
+            const bad = Boolean(r && (r.left < rowRect.left - 2 || r.right > rowRect.right + 2 || r.top < rowRect.top - 2 || r.bottom > rowRect.bottom + 2));
+            if (bad) outside++;
+            if (samples.length < 3 || (bad && samples.length < 8)) samples.push({
+                rowTag: model.row.tagName.toLowerCase(), itemId: model.id, hasUid: Boolean(model.uid),
+                mountTag: chip?.parentElement.parentElement.tagName.toLowerCase() || null,
+                rowDisplay: getComputedStyle(model.row).display, rowBox: box(model.row), widgetBox: box(chip), widgets: widgets.length, outside: bad
+            });
+        }
+        return { version: VERSION, identityNodes: state.rowCandidates, itemRows: rows.length, outside, duplicates, missing, samples };
+    }
+    function checkLayoutSoon() {
+        if (state.layoutFrame) return;
+        state.layoutFrame = requestAnimationFrame(() => {
+            state.layoutFrame = 0;
+            const report = layoutSnapshot();
+            const sig = JSON.stringify([report.itemRows, report.outside, report.duplicates, report.missing]);
+            if (sig === state.lastLayout) return;
+            state.lastLayout = sig;
+            log("Layout check", { rows: report.itemRows, outside: report.outside, duplicates: report.duplicates, missing: report.missing }, report.outside || report.duplicates ? "WARN" : "INFO");
+        });
     }
 
     function closeModal() {
@@ -838,7 +925,10 @@
         panel.append(el("h3", "Temporary effect legend"));
         panel.append(el("p", "🌶️ pepper spray · 😵‍💫 concussion · ⚡ flash · 😶‍🌫️ smoke · 😭 tear gas · ☣️ nerve gas · 🔥 burning · 🪢 ensnare · 💥 explosive damage · 🫥 Stygian Darkness · 💪 / 🏃 / 🛡️ / 🎯 self buffs · 🎉 decorative. Tap stats for the catalog effect description.", P + "muted"));
         panel.append(el("h3", "Diagnostics")); const debug = el("div", null, P + "actions");
-        debug.append(button("🪲", () => { closeModal(); MyDebug.toggleView(); }), button("📋 Copy Logs to Clipboard", function () { log("Diagnostic summary", { version: VERSION, rows: state.scanned, loaded: state.loaded, rootFound: Boolean(state.root), blocked: Boolean(state.blocked) }); void MyDebug.copy(this); })); panel.append(debug);
+        debug.append(button("🪲", () => { closeModal(); MyDebug.toggleView(); }), button("📋 Copy Logs to Clipboard", function () {
+            log("Diagnostic summary", { version: VERSION, rows: state.scanned, loaded: state.loaded, rootFound: Boolean(state.root), blocked: Boolean(state.blocked) });
+            log("Layout diagnostics", layoutSnapshot()); void MyDebug.copy(this);
+        })); panel.append(debug);
         panel.append(el("h3", "Support ThaWookie")); const supportHost = el("div"); supportHost.id = P + "support-host"; panel.append(supportHost);
         state.support = createEmbeddedSupportModule(supportHost);
         panel.append(link("Greasy Fork: ShavedW00kie", "https://greasyfork.org/en/users/1597765-shavedw00kie"));
@@ -888,7 +978,7 @@
 
     function nativeClick(event) {
         if (owned(event.target) || !(event.target instanceof Element) || !state.root || !state.root.contains(event.target)) return;
-        const row = event.target.closest(ROWS);
+        const row = inventoryRow(event.target);
         if (row && state.opts.referenceMode === "selected" && !event.target.closest('a,button,input,select,label,[role="button"],.option,.option-wrap')) {
             const model = readRow(row); if (model && model.group && (model.uid || model.group === "Temporary")) { state.pins.set(model.group, { id: model.id, uid: model.uid }); schedule(); }
         }
@@ -3021,4 +3111,4 @@ function initializeModularDebugger(scriptNamespace) {
 // END SUPPLIED DEBUGGER MODULE
 
     void boot().catch(error => MyDebug.log({ event: "Startup failed", message: error.message }, "ERROR"));
-})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.0.3" } });
+})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.0.4" } });
