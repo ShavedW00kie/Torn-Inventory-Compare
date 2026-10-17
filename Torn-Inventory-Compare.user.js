@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn-Inventory-Compare
 // @namespace    https://github.com/ShavedW00kie/
-// @version      1.0.2
+// @version      1.0.3
 // @description  Compare individual inventory weapon and armor stats with the equipped or chosen item in the same slot. Includes temporary effects, coverage, settings and diagnostics.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -43,7 +43,7 @@
     "use strict";
 
     const MyDebug = initializeModularDebugger(GM_info.script.name);
-    const VERSION = "1.0.2";
+    const VERSION = "1.0.3";
     const P = "tw-ic-";
     if (document.getElementById(P + "active")) return;
     const marker = document.createElement("meta");
@@ -318,9 +318,18 @@
         return null;
     }
     function isEquipped(row) {
-        if (row.getAttribute("data-equipped") === "true" || row.getAttribute("data-equipped") === "1") return true;
+        const explicit = row.getAttribute("data-equipped");
+        if (explicit === "true" || explicit === "1") return true;
+        if (explicit === "false" || explicit === "0") return false;
         if (/(?:^|\s)(?:equipped|is-equipped|item-equipped)(?:\s|$)/.test(row.className)) return true;
-        return Boolean(row.querySelector('.option-unequip,[data-action="unequip"],.equipped:not([data-tw-ic-owned])'));
+        const selector = '.option-unequip,.unequip,[data-action="unequip"],.equipped,[title],[aria-label],[data-tooltip]';
+        return Array.from(row.querySelectorAll(selector)).some(control => {
+            // Torn may retain hidden Equip/Unequip controls for every row.
+            // Only visible, semantically identified controls define the reference.
+            if (owned(control) || !control.getClientRects().length || getComputedStyle(control).visibility === "hidden") return false;
+            if (control.matches('.option-unequip,.unequip,[data-action="unequip"],.equipped')) return true;
+            return ["title", "aria-label", "data-tooltip"].some(attr => /^(?:(?:click|tap)\s+(?:here\s+)?to\s+)?unequip\b/i.test(clean(control.getAttribute(attr))));
+        });
     }
     function readRow(row) {
         const id = uidOf(row.getAttribute("data-item") || row.getAttribute("data-itemid") || row.getAttribute("data-item-id"));
@@ -346,7 +355,27 @@
         return { id, uid, weak, name: name || "Item " + id, row, group: groupOf(catalog), equipped: isEquipped(row) };
     }
     function inventoryCategory(group) { return Object.keys(SLOT_AREA).includes(group) ? "Defensive" : group; }
-    function rowHost(row) { return row.querySelector(".name-wrap") || row.querySelector("li.desc,.desc,.name") || row; }
+    function rowHost(row, model) {
+        if (getComputedStyle(row).display !== "table-row") return row;
+        const candidates = Array.from(row.querySelectorAll(".name-wrap,.name,.desc,[data-item-name],td,th,div,span"));
+        let cell = candidates.find(n => !owned(n) && getComputedStyle(n).display === "table-cell" && clean(n.textContent).includes(model.name));
+        if (!cell) cell = candidates.find(n => !owned(n) && /^(?:name|name-wrap|desc)$/.test(n.className) && clean(n.textContent).includes(model.name));
+        return cell || row;
+    }
+    function prepareRow(row, model, wrap) {
+        const host = rowHost(row, model);
+        if (!row.classList.contains(P + "annotated")) row.classList.add(P + "annotated");
+        // Attribute is a layout hook, not an ownership marker: native row
+        // mutations must remain visible to the inventory observer.
+        const mode = host === row ? "footer" : "cell";
+        if (row.getAttribute("data-tw-ic-mount") !== mode) row.setAttribute("data-tw-ic-mount", mode);
+        if (wrap.parentElement !== host) host.appendChild(wrap);
+    }
+    function releaseRow(row, wrap) {
+        if (wrap) wrap.remove();
+        row.classList.remove(P + "annotated");
+        row.removeAttribute("data-tw-ic-mount");
+    }
     function findRoot() { return document.querySelector("div.items-wrap,.items-wrap,#all-items"); }
     function owned(node) { const e = node && (node.nodeType === 1 ? node : node.parentElement); return Boolean(e && e.closest && e.closest("[data-tw-ic-owned]")); }
     function schedule() {
@@ -573,17 +602,33 @@
         if (document.getElementById(P + "styles")) return;
         const node = el("style"); node.id = P + "styles"; node.setAttribute("data-tw-ic-owned", "style");
         node.textContent = `
-        .${P}wrap{display:inline-flex;max-width:100%;margin:2px 0 2px 8px;vertical-align:middle;line-height:1.3;float:none}
-        .${P}chip{display:flex!important;flex-direction:column;align-items:flex-start;gap:1px;max-width:100%;min-height:28px;
-          margin:0!important;padding:2px 4px!important;border:0!important;border-radius:4px;background:#171c20e8!important;
-          color:#edf4f7!important;font:var(--tw-ic-size,11px)/1.35 Arial,sans-serif!important;text-transform:none!important;
-          text-shadow:none!important;cursor:pointer;box-shadow:none!important;white-space:normal;touch-action:manipulation}
-        .${P}line{display:flex;align-items:center;flex-wrap:wrap;gap:8px;max-width:100%}
-        .${P}metric{display:inline-flex;align-items:center;gap:3px;white-space:nowrap;font-variant-numeric:tabular-nums}
-        .${P}arrow{font-family:Arial,sans-serif;font-weight:700;font-size:1.25em;line-height:1}
+        /* Give comparisons a separate line within the native row. Native
+           weapon/action columns retain their own sizing and event handlers. */
+        .${P}annotated{height:auto!important;max-height:none!important;flex-wrap:wrap!important}
+        .${P}annotated .${P}wrap{display:block!important;position:static!important;float:none!important;clear:both!important;
+          box-sizing:border-box!important;width:100%!important;min-width:0!important;max-width:100%!important;
+          height:auto!important;min-height:0!important;max-height:none!important;margin:0!important;
+          padding:3px 8px!important;flex:0 0 100%!important;grid-column:1/-1!important;align-self:stretch!important;
+          white-space:normal!important;text-align:left!important;line-height:normal!important;overflow:visible!important}
+        .${P}annotated[data-tw-ic-mount="cell"] .${P}wrap{padding:3px 0!important}
+        .${P}annotated .${P}wrap *{box-sizing:border-box!important;float:none!important;position:static!important;
+          inset:auto!important;min-width:0!important;max-width:100%!important;width:auto!important;height:auto!important;
+          margin:0!important;padding:0!important;border:0!important;text-indent:0!important;letter-spacing:normal!important;
+          text-transform:none!important;vertical-align:baseline!important;font-family:Arial,sans-serif!important;
+          line-height:inherit!important}
+        .${P}annotated .${P}wrap .${P}chip{display:inline-flex!important;flex-direction:column!important;align-items:flex-start!important;
+          justify-content:center!important;gap:1px!important;min-height:24px!important;margin:0!important;padding:2px 5px!important;
+          border:0!important;border-radius:4px!important;background:#171c20e8!important;color:#edf4f7!important;
+          font:var(--tw-ic-size,11px)/1.35 Arial,sans-serif!important;text-shadow:none!important;cursor:pointer;
+          box-shadow:none!important;white-space:normal!important;touch-action:manipulation}
+        .${P}annotated .${P}wrap .${P}line{display:flex!important;align-items:center!important;flex-wrap:wrap!important;gap:8px!important}
+        .${P}annotated .${P}wrap .${P}metric{display:inline-flex!important;align-items:center!important;gap:3px!important;
+          white-space:nowrap!important;font-variant-numeric:tabular-nums!important}
+        .${P}annotated .${P}wrap .${P}arrow{font-weight:700!important;font-size:1.25em!important;line-height:1!important}
         .${P}up{color:var(--tw-ic-up,#79e6a5)!important}.` + P + `down{color:var(--tw-ic-down,#99d9ff)!important}
         .${P}equal{color:#d5dce1!important}.` + P + `unknown{color:#c9c1a7!important}
-        .${P}rof{font-size:.86em;opacity:.95}.` + P + `delta{font-size:.9em;opacity:.85}
+        .${P}annotated .${P}wrap .${P}rof{font-size:.86em!important;opacity:.95}
+        .${P}annotated .${P}wrap .${P}delta{font-size:.9em!important;opacity:.85}
         .${P}toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:34px;margin:4px 0;
           padding:2px 5px;box-sizing:border-box;color:#dbe6ed;background:#22292fd9;border-radius:5px;font:11px/1.3 Arial,sans-serif;clear:both}
         .${P}toolbar>div{min-width:0;overflow-wrap:anywhere}
@@ -613,7 +658,8 @@
         #${P}support{position:static!important;inset:auto!important;z-index:auto!important;width:100%!important;display:flex!important;
           flex-direction:column!important;gap:8px!important;margin:4px 0!important}
         #${P}support .tw-support-btn{max-width:100%;min-width:0}
-        @media(max-width:480px){.${P}wrap{margin-left:5px}.${P}chip{padding:1px 3px!important}.${P}line{gap:5px}
+        @media(max-width:480px){.${P}annotated .${P}wrap{padding:3px 4px!important}
+          .${P}annotated .${P}wrap .${P}line{gap:5px!important}
           .${P}overlay{padding:8px}.${P}panel{padding:12px;max-height:90vh;max-height:90dvh}}
         `;
         (document.head || document.documentElement).appendChild(node); applyTheme();
@@ -642,14 +688,15 @@
     function renderRow(model, ref) {
         const row = model.row; let wrap = Array.from(row.querySelectorAll("." + P + "wrap")).find(n => n.closest(ROWS) === row);
         const cat = catalogEntry(model.id);
-        if ((!model.group && !(cat && cat.type === "Armor")) || !state.opts.enabled) { if (wrap) wrap.remove(); return; }
+        if ((!model.group && !(cat && cat.type === "Armor")) || !state.opts.enabled) { releaseRow(row, wrap); return; }
         const actual = statsFor(model); const base = ref && statsFor(ref);
         const area = state.opts.coverageArea === "slot" ? SLOT_AREA[model.group] : state.opts.coverageArea;
         const sig = JSON.stringify([model.id, model.uid, actual, ref && [ref.id, ref.uid], base, state.opts, cat && cat.details, model.equipped]);
-        if (wrap && wrap.getAttribute("data-signature") === sig) { state.rowModels.set(row, model); return; }
         if (!wrap) {
-            wrap = el("span", null, P + "wrap"); wrap.setAttribute("data-tw-ic-owned", "row"); rowHost(row).appendChild(wrap);
+            wrap = el("div", null, P + "wrap"); wrap.setAttribute("data-tw-ic-owned", "row");
         }
+        prepareRow(row, model, wrap);
+        if (state.rowModels.has(row) && wrap.getAttribute("data-signature") === sig) { state.rowModels.set(row, model); return; }
         wrap.setAttribute("data-signature", sig); wrap.replaceChildren(); state.rowModels.set(row, model);
         const chip = button("", () => openDetails(model, ref), P + "chip");
         const line = el("span", null, P + "line"); const baseline = sameItem(model, ref);
@@ -864,6 +911,7 @@
         });
         state.discovery.observe(document.documentElement, { childList: true, subtree: true });
         window.addEventListener("pageshow", schedule);
+        window.addEventListener("resize", schedule, { passive: true });
         window.addEventListener("hashchange", schedule);
         window.addEventListener("focus", () => { if (Date.now() - state.equipmentAt > 120000) state.equipmentWanted = true; schedule(); });
         document.addEventListener("visibilitychange", () => { if (!document.hidden) { if (Date.now() - state.equipmentAt > 120000) state.equipmentWanted = true; schedule(); } });
@@ -2973,4 +3021,4 @@ function initializeModularDebugger(scriptNamespace) {
 // END SUPPLIED DEBUGGER MODULE
 
     void boot().catch(error => MyDebug.log({ event: "Startup failed", message: error.message }, "ERROR"));
-})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.0.2" } });
+})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.0.3" } });
