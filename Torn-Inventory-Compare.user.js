@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn-Inventory-Compare
 // @namespace    https://github.com/ShavedW00kie/
-// @version      1.0.5
+// @version      1.0.6
 // @description  Compare individual inventory weapon and armor stats with the equipped or chosen item in the same slot. Includes temporary effects, coverage, settings and diagnostics.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -43,7 +43,7 @@
     "use strict";
 
     const MyDebug = initializeModularDebugger(GM_info.script.name);
-    const VERSION = "1.0.5";
+    const VERSION = "1.0.6";
     const P = "tw-ic-";
     if (document.getElementById(P + "active")) return;
     const marker = document.createElement("meta");
@@ -54,7 +54,8 @@
     const TTL = { catalog: 86400000, detail: 21600000, inventory: 3600000 };
     const DEFAULTS = Object.freeze({
         enabled: true, showValues: true, showDeltas: false, showRoF: true,
-        showEffects: true, fontSize: 11, upColor: "#79e6a5", downColor: "#99d9ff",
+        showEffects: true, fontSize: 11, arrowSize: 18, effectSize: 22, layout: "inline",
+        upColor: "#79e6a5", downColor: "#99d9ff",
         referenceMode: "equipped", coverageArea: "slot", armorSlots: {}
     });
     const GROUPS = ["Primary", "Secondary", "Melee", "Temporary", "head", "body", "hands", "legs", "feet", "fullbody"];
@@ -140,6 +141,9 @@
         if (["equipped", "selected"].includes(input.referenceMode)) o.referenceMode = input.referenceMode;
         if (["slot", ...AREAS].includes(input.coverageArea)) o.coverageArea = input.coverageArea;
         o.fontSize = Math.max(9, Math.min(15, number(input.fontSize) || 11));
+        o.arrowSize = Math.max(12, Math.min(30, number(input.arrowSize) || DEFAULTS.arrowSize));
+        o.effectSize = Math.max(14, Math.min(32, number(input.effectSize) || DEFAULTS.effectSize));
+        if (["inline", "below"].includes(input.layout)) o.layout = input.layout;
         for (const k of ["upColor", "downColor"]) if (/^#[0-9a-f]{6}$/i.test(input[k])) o[k] = input[k];
         if (input.armorSlots && typeof input.armorSlots === "object") {
             o.armorSlots = Object.fromEntries(Object.entries(input.armorSlots).filter(([id, g]) => /^\d+$/.test(id) && Object.keys(SLOT_AREA).includes(g)));
@@ -396,19 +400,53 @@
         return { id, uid, weak, name: name || "Item " + id, row, group: groupOf(catalog), equipped: isEquipped(row) };
     }
     function inventoryCategory(group) { return Object.keys(SLOT_AREA).includes(group) ? "Defensive" : group; }
+    function nameHost(row) {
+        // Mount only inside this item's name area. The v1.0.5 ownership check
+        // keeps repeated action metadata from becoming independent rows.
+        return Array.from(row.querySelectorAll(".name-wrap,[data-item-name],.name")).find(node =>
+            !owned(node) && inventoryRow(node) === row &&
+            !node.closest('a,button,label,[role="button"],[contenteditable="true"]')) || null;
+    }
     function rowHost(row, model) {
+        if (state.opts.layout === "inline") {
+            const host = nameHost(row);
+            if (host) return host;
+        }
         if (!["table-row", "table", "inline-table"].includes(getComputedStyle(row).display)) return row;
         const candidates = Array.from(row.querySelectorAll(".name-wrap,.name,.desc,[data-item-name],td,th,div,span"));
         let cell = candidates.find(n => !owned(n) && getComputedStyle(n).display === "table-cell" && clean(n.textContent).includes(model.name));
         if (!cell) cell = candidates.find(n => !owned(n) && /^(?:name|name-wrap|desc)$/.test(n.className) && clean(n.textContent).includes(model.name));
         return cell || row;
     }
+    function inlineClasses(row, host) {
+        const grow = new Set(), clear = new Set();
+        if (host) for (let node = host.parentElement; node && row.contains(node); node = node.parentElement) {
+            grow.add(node);
+            // Clear floats with owned empty elements instead of overriding the
+            // native display type, so breakpoint changes still take effect.
+            if (["block", "list-item"].includes(getComputedStyle(node).display)) clear.add(node);
+            if (node === row) break;
+        }
+        const nodes = new Set([row, ...grow, ...row.querySelectorAll("." + P + "inline-host,." + P + "inline-grow")]);
+        if (host) nodes.add(host);
+        for (const node of nodes) for (const [suffix, active] of [["inline-host", node === host], ["inline-grow", grow.has(node)]]) {
+            // Do not emit unchanged class mutations on every inventory scan.
+            const cls = P + suffix;
+            if (node.classList.contains(cls) !== active) node.classList.toggle(cls, active);
+        }
+        for (const node of row.querySelectorAll("." + P + "inline-clear")) if (!clear.has(node.parentElement)) node.remove();
+        for (const parent of clear) if (!Array.from(parent.children).some(node => node.classList.contains(P + "inline-clear"))) {
+            const node = el("span", null, P + "inline-clear"); node.setAttribute("data-tw-ic-owned", "layout"); node.setAttribute("aria-hidden", "true"); parent.append(node);
+        }
+    }
     function prepareRow(row, model, wrap) {
         const host = rowHost(row, model);
         if (!row.classList.contains(P + "annotated")) row.classList.add(P + "annotated");
         // Attribute is a layout hook, not an ownership marker: native row
         // mutations must remain visible to the inventory observer.
-        const mode = host === row ? "footer" : "cell";
+        const inline = state.opts.layout === "inline" && host !== row && host === nameHost(row);
+        const mode = inline ? "inline" : host === row ? "footer" : "cell";
+        inlineClasses(row, inline ? host : null);
         if (row.getAttribute("data-tw-ic-mount") !== mode) row.setAttribute("data-tw-ic-mount", mode);
         if (wrap.parentElement !== host) host.appendChild(wrap);
     }
@@ -417,6 +455,7 @@
         else row.querySelectorAll("." + P + "wrap").forEach(n => n.remove());
         if (row.classList.contains(P + "annotated")) row.classList.remove(P + "annotated");
         if (row.hasAttribute("data-tw-ic-mount")) row.removeAttribute("data-tw-ic-mount");
+        inlineClasses(row, null);
         state.rowModels.delete(row);
     }
     function findRoot() { return document.querySelector("div.items-wrap,.items-wrap,#all-items"); }
@@ -512,6 +551,64 @@
         if (found) return { symbol: found[1], text: text || found[2], label: found[2] };
         if (/burn|fire damage/i.test(text)) return { symbol: "🔥", text, label: "Burning effect" };
         return { symbol: text ? "✦" : "·", text: text || "No special effect reported by the catalog.", label: text ? "See catalog effect" : "No special effect reported" };
+    }
+
+    // Combat effects are separate from catalog.effect, which can describe
+    // crime uses (the Flamethrower's catalog effect describes Arson).
+    // Innate effects: https://wiki.torn.com/wiki/Weapon_Bonus
+    // No proc chance or rolled bonus value is guessed from the weapon's name.
+    const COMBAT_EFFECTS = Object.freeze({
+        burn: ["🔥", "Burn", "Can inflict Burning damage over time."],
+        "severe burning": ["🔥", "Severe Burning", "Burning damage over time."],
+        shock: ["⚡", "Shock", "Can cause the opponent to miss their next turn."],
+        poisoned: ["☠️", "Poisoned", "Poison damage over time."],
+        bleed: ["🩸", "Bleed", "Bleeding damage over time."],
+        laceration: ["🩸", "Laceration", "Laceration damage over time."],
+        freeze: ["❄️", "Freeze", "Reduces the opponent's speed and dexterity."],
+        demoralized: ["😰", "Demoralized", "Reduces the opponent's battle stats."],
+        toxin: ["☣️", "Toxin", "Applies a random battle-stat debuff."],
+        stun: ["😵‍💫", "Stun", "Can cause the opponent to miss their next turn."],
+        paralyze: ["🔒", "Paralyze", "Can cause the opponent to miss turns."],
+        suppress: ["🔊", "Suppress", "Can cause the opponent to miss future turns."],
+        wither: ["🥀", "Wither", "Reduces the opponent's strength."],
+        slow: ["🐌", "Slow", "Reduces the opponent's speed."],
+        cripple: ["🦵", "Cripple", "Reduces the opponent's dexterity."],
+        weaken: ["🛡️", "Weaken", "Reduces the opponent's defense."],
+        eviscerate: ["💢", "Eviscerate", "Increases damage received by the opponent."],
+        disarm: ["🚫", "Disarm", "Temporarily disables the opponent's weapon."]
+    });
+    function combatEffectKey(title) {
+        const key = clean(title).toLowerCase();
+        return ({ burning: "burn", poison: "poisoned", bleeding: "bleed", demoralize: "demoralized", paralyzed: "paralyze" })[key] || key;
+    }
+    function weaponEffects(item, actual) {
+        if (!item || item.type !== "Weapon") return [];
+        if (groupOf(item) === "Temporary") return [effect(item)];
+        const effects = new Map();
+        for (const bonus of actual?.bonuses || []) {
+            if (!bonus || typeof bonus !== "object") continue;
+            const key = combatEffectKey(bonus.title || bonus.name), definition = Object.hasOwn(COMBAT_EFFECTS, key) ? COMBAT_EFFECTS[key] : null;
+            if (!definition) continue;
+            const value = number(bonus.value);
+            effects.set(key, { symbol: definition[0], label: definition[1] + (value !== null ? " · " + fmt(value) : ""),
+                text: clean(bonus.description) || definition[2], source: "Individual item bonus" });
+        }
+        const innate = { flamethrower: "burn", taser: "shock", "cattle prod": "shock", blowgun: "poisoned",
+            "snow cannon": "freeze", "bread knife": "laceration", "gold plated ak-47": "demoralized", "poison umbrella": "toxin" };
+        const name = clean(item.name).toLowerCase();
+        const key = Object.hasOwn(innate, name) ? innate[name] : "";
+        if (key && !effects.has(key)) {
+            const definition = COMBAT_EFFECTS[key];
+            effects.set(key, { symbol: definition[0], label: definition[1], text: definition[2],
+                source: "Known innate effect; this copy's bonus value is unavailable" });
+        }
+        return [...effects.values()];
+    }
+    function effectIcon(value) {
+        const icon = el("span", value.symbol, P + "effect");
+        const description = value.label + ": " + value.text + (value.source ? " · " + value.source : "");
+        icon.title = description; icon.setAttribute("role", "img"); icon.setAttribute("aria-label", description);
+        return icon;
     }
 
     async function loadCatalog(category, force = false) {
@@ -645,7 +742,7 @@
     }
 
     function applyTheme() {
-        const css = `:root{--tw-ic-up:${state.opts.upColor};--tw-ic-down:${state.opts.downColor};--tw-ic-size:${state.opts.fontSize}px}`;
+        const css = `:root{--tw-ic-up:${state.opts.upColor};--tw-ic-down:${state.opts.downColor};--tw-ic-size:${state.opts.fontSize}px;--tw-ic-arrow-size:${state.opts.arrowSize}px;--tw-ic-effect-size:${state.opts.effectSize}px}`;
         let node = document.getElementById(P + "theme");
         if (!node) { node = el("style"); node.id = P + "theme"; node.setAttribute("data-tw-ic-owned", "theme"); (document.head || document.documentElement).appendChild(node); }
         if (node.textContent !== css) node.textContent = css;
@@ -654,15 +751,25 @@
         if (document.getElementById(P + "styles")) return;
         const node = el("style"); node.id = P + "styles"; node.setAttribute("data-tw-ic-owned", "style");
         node.textContent = `
-        /* Give comparisons a separate line within the native row. Native
-           weapon/action columns retain their own sizing and event handlers. */
+        /* Both layouts stay within the resolved native inventory row. */
         .${P}annotated{height:auto!important;max-height:none!important;flex-wrap:wrap!important}
+        .${P}inline-grow{height:auto!important;max-height:none!important}
+        .${P}annotated .${P}inline-clear{display:block!important;position:static!important;clear:both!important;float:none!important;
+          width:0!important;min-width:0!important;height:0!important;min-height:0!important;line-height:0!important;
+          margin:0!important;padding:0!important;border:0!important;overflow:hidden!important}
+        .${P}inline-host{display:flex!important;flex-wrap:wrap!important;align-items:center!important;column-gap:8px!important;row-gap:2px!important;
+          min-width:0!important;max-width:100%!important;height:auto!important;max-height:none!important;
+          box-sizing:border-box!important;white-space:normal!important;overflow:visible!important}
+        .${P}inline-host>.name{float:none!important;min-width:0!important;max-width:100%!important;flex:0 1 auto!important;
+          white-space:normal!important;overflow-wrap:anywhere!important}
         .${P}annotated .${P}wrap{display:block!important;position:static!important;float:none!important;clear:both!important;
           box-sizing:border-box!important;width:100%!important;min-width:0!important;max-width:100%!important;
           height:auto!important;min-height:0!important;max-height:none!important;margin:0!important;
           padding:3px 8px!important;flex:0 0 100%!important;grid-column:1/-1!important;align-self:stretch!important;
           white-space:normal!important;text-align:left!important;line-height:normal!important;overflow:visible!important}
         .${P}annotated[data-tw-ic-mount="cell"] .${P}wrap{padding:3px 0!important}
+        .${P}annotated[data-tw-ic-mount="inline"] .${P}wrap{display:inline-flex!important;width:auto!important;
+          flex:0 1 auto!important;clear:none!important;padding:1px 0!important;align-self:center!important}
         .${P}annotated .${P}wrap *{box-sizing:border-box!important;float:none!important;position:static!important;
           inset:auto!important;min-width:0!important;max-width:100%!important;width:auto!important;height:auto!important;
           margin:0!important;padding:0!important;border:0!important;text-indent:0!important;letter-spacing:normal!important;
@@ -676,7 +783,10 @@
         .${P}annotated .${P}wrap .${P}line{display:flex!important;align-items:center!important;flex-wrap:wrap!important;gap:8px!important}
         .${P}annotated .${P}wrap .${P}metric{display:inline-flex!important;align-items:center!important;gap:3px!important;
           white-space:nowrap!important;font-variant-numeric:tabular-nums!important}
-        .${P}annotated .${P}wrap .${P}arrow{font-weight:700!important;font-size:1.25em!important;line-height:1!important}
+        .${P}annotated .${P}wrap .${P}arrow{font-weight:700!important;font-size:var(--tw-ic-arrow-size,18px)!important;line-height:1!important;flex-shrink:0!important}
+        .${P}annotated .${P}wrap .${P}effect{display:inline-block!important;font-size:var(--tw-ic-effect-size,22px)!important;
+          font-family:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif!important;
+          line-height:1.15!important;flex-shrink:0!important;white-space:nowrap!important}
         .${P}up{color:var(--tw-ic-up,#79e6a5)!important}.` + P + `down{color:var(--tw-ic-down,#99d9ff)!important}
         .${P}equal{color:#d5dce1!important}.` + P + `unknown{color:#c9c1a7!important}
         .${P}annotated .${P}wrap .${P}rof{font-size:.86em!important;opacity:.95}
@@ -711,6 +821,7 @@
           flex-direction:column!important;gap:8px!important;margin:4px 0!important}
         #${P}support .tw-support-btn{max-width:100%;min-width:0}
         @media(max-width:480px){.${P}annotated .${P}wrap{padding:3px 4px!important}
+          .${P}annotated[data-tw-ic-mount="inline"] .${P}wrap{padding:1px 0!important}
           .${P}annotated .${P}wrap .${P}line{gap:5px!important}
           .${P}overlay{padding:8px}.${P}panel{padding:12px;max-height:90vh;max-height:90dvh}}
         `;
@@ -747,7 +858,7 @@
         const area = state.opts.coverageArea === "slot" ? SLOT_AREA[model.group] : state.opts.coverageArea;
         const sig = JSON.stringify([model.id, model.uid, actual, ref && [ref.id, ref.uid], base, state.opts, cat && cat.details, model.equipped]);
         if (!wrap) {
-            wrap = el("div", null, P + "wrap"); wrap.setAttribute("data-tw-ic-owned", "row");
+            wrap = el("span", null, P + "wrap"); wrap.setAttribute("data-tw-ic-owned", "row");
         }
         prepareRow(row, model, wrap);
         if (state.rowModels.get(row)?.widget === wrap && wrap.querySelector("." + P + "chip") && wrap.getAttribute("data-signature") === sig) { state.rowModels.set(row, { widget: wrap, model }); return; }
@@ -756,7 +867,6 @@
         const line = el("span", null, P + "line"); const baseline = sameItem(model, ref);
         if (model.group === "Temporary") {
             line.append(metric("D", actual && actual.damage, base && base.damage));
-            if (state.opts.showEffects) { const e = effect(cat); const icon = el("span", e.symbol); icon.title = e.label; icon.setAttribute("aria-label", e.label); line.append(icon); }
         } else if (cat && cat.type === "Armor") {
             line.append(metric("AR", actual && actual.armor, base && base.armor));
             if (model.group) line.append(metric("C(" + (AREA_SHORT[area] || "?") + ")", coverage(cat, area), ref ? coverage(catalogEntry(ref.id), area) : null, true));
@@ -764,6 +874,7 @@
         } else {
             line.append(metric("D", actual && actual.damage, base && base.damage), metric("A", actual && actual.accuracy, base && base.accuracy));
         }
+        if (state.opts.showEffects) for (const value of weaponEffects(cat, actual)) line.append(effectIcon(value));
         if (baseline) { const b = el("span", "◎", P + "equal"); b.setAttribute("aria-label", "Reference item"); line.append(b); }
         chip.append(line);
         const rate = rof(cat);
@@ -943,11 +1054,17 @@
         credentials.append(key, keyActions, feedback, el("small", state.fallbackStorage ? "This WebView uses session storage. Your key may need entering again after closing the session." : "The key is stored through the userscript manager and sent only to api.torn.com. It is never included in copied logs.")); panel.append(credentials);
         const settings = el("div", null, P + "stack"); settings.append(el("h3", "Display and reference"));
         settingCheck(settings, "enabled", "Enable comparisons"); settingCheck(settings, "showValues", "Show actual numeric ratings");
-        settingCheck(settings, "showDeltas", "Show numeric differences"); settingCheck(settings, "showRoF", "Show firearm rate of fire"); settingCheck(settings, "showEffects", "Show temporary effect symbols");
+        settingCheck(settings, "showDeltas", "Show numeric differences"); settingCheck(settings, "showRoF", "Show firearm rate of fire"); settingCheck(settings, "showEffects", "Show weapon effect icons");
+        settings.append(field("Comparison placement", optionSelect([["inline", "Inline beside item name"], ["below", "Below each item (previous layout)"]], state.opts.layout, v => {
+            state.opts.layout = v; saveOptions(); schedule();
+        })));
         settings.append(field("Reference behavior", optionSelect([["equipped", "Equipped item, with optional chosen override"], ["selected", "Last tapped inventory item"]], state.opts.referenceMode, v => { state.opts.referenceMode = v; clearReferences(); saveOptions(); })),
             field("Coverage area", optionSelect([["slot", "Slot area: head / chest / hand / leg / foot"], ...AREAS.map(a => [a, a])], state.opts.coverageArea, v => { state.opts.coverageArea = v; saveOptions(); schedule(); })));
-        const size = el("input"); size.type = "number"; size.min = "9"; size.max = "15"; size.value = state.opts.fontSize; size.style.maxWidth = "72px";
-        size.addEventListener("change", () => { state.opts.fontSize = Math.max(9, Math.min(15, number(size.value) || 11)); size.value = state.opts.fontSize; saveOptions(); applyTheme(); schedule(); }); settings.append(field("Stat text size (px)", size));
+        for (const [key, label, min, max] of [["fontSize", "Stat text size (px)", 9, 15], ["arrowSize", "Arrow size (px)", 12, 30], ["effectSize", "Effect icon size (px)", 14, 32]]) {
+            const size = el("input"); size.type = "number"; size.min = String(min); size.max = String(max); size.value = state.opts[key]; size.style.maxWidth = "72px";
+            size.addEventListener("change", () => { state.opts[key] = Math.max(min, Math.min(max, number(size.value) || DEFAULTS[key])); size.value = state.opts[key]; saveOptions(); applyTheme(); schedule(); });
+            settings.append(field(label, size));
+        }
         for (const [k, label] of [["upColor", "↑ Higher value color"], ["downColor", "↓ Lower value color"]]) {
             const input = el("input"); input.type = "color"; input.value = state.opts[k];
             input.addEventListener("change", () => { state.opts[k] = input.value; saveOptions(); applyTheme(); schedule(); }); settings.append(field(label, input));
@@ -956,6 +1073,9 @@
         settings.append(refreshActions); panel.append(settings);
         panel.append(el("p", "D = intrinsic damage rating, not predicted HP damage. A = accuracy. AR = armor. C(area) = coverage of that body area. ↑ higher, ↓ lower, = equal, ? unavailable. RoF is the unmodified rounds-per-turn range, not attack speed; ↕ means mixed bounds. Player perks, ammo, weapon mods and combat circumstances can change outcomes.", P + "callout"));
         panel.append(el("p", "Inventory API lists can be an hour old. Individual copies are matched only by UID. Missing UIDs are never assigned by name or row order. Expand an item's native information if its UID is unavailable, then refresh. Pins last for this page session.", P + "muted"));
+        panel.append(el("p", "Inline comparisons sit beside the item name and wrap within its name area when needed. Choose the previous layout to put comparisons below each row. Arrow and effect icon sizes can be adjusted independently.", P + "muted"));
+        panel.append(el("h3", "Weapon effect icons"));
+        panel.append(el("p", "🔥 Burn · ⚡ Shock · ☠️ Poisoned · 🩸 Bleed / Laceration · ❄️ Freeze · 😵‍💫 Stun. Icons identify effects a weapon can apply; they do not mean an effect is guaranteed to trigger. Tap the comparison to see its effect labels and reported bonuses.", P + "muted"));
         panel.append(el("h3", "Temporary effect legend"));
         panel.append(el("p", "🌶️ pepper spray · 😵‍💫 concussion · ⚡ flash · 😶‍🌫️ smoke · 😭 tear gas · ☣️ nerve gas · 🔥 burning · 🪢 ensnare · 💥 explosive damage · 🫥 Stygian Darkness · 💪 / 🏃 / 🛡️ / 🎯 self buffs · 🎉 decorative. Tap stats for the catalog effect description.", P + "muted"));
         panel.append(el("h3", "Diagnostics")); const debug = el("div", null, P + "actions");
@@ -987,6 +1107,10 @@
         if (model.group === "Temporary") {
             const e = effect(item); panel.append(el("p", e.symbol + " " + e.label, P + "callout")); panel.append(el("p", e.text));
             panel.append(el("p", "Displayed damage is the fixed item rating. It does not predict HP lost or compare the tactical value of buffs and debuffs.", P + "muted"));
+        } else {
+            const effects = weaponEffects(item, actual);
+            if (effects.length) panel.append(el("h3", "Weapon effects"));
+            for (const value of effects) panel.append(el("p", value.symbol + " " + value.label + ": " + value.text, P + "callout"), el("small", value.source));
         }
         if (item && item.type === "Armor") {
             panel.append(el("h3", "Coverage by body area")); const ct = el("table", null, P + "table"); tableRow(ct, ["Area", "This item", "Reference", "Change"], true);
@@ -3145,4 +3269,4 @@ function initializeModularDebugger(scriptNamespace) {
 // END SUPPLIED DEBUGGER MODULE
 
     void boot().catch(error => MyDebug.log({ event: "Startup failed", message: error.message }, "ERROR"));
-})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.0.5" } });
+})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.0.6" } });
