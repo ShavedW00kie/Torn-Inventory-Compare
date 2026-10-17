@@ -1,0 +1,2976 @@
+// ==UserScript==
+// @name         Torn-Inventory-Compare
+// @namespace    https://github.com/ShavedW00kie/
+// @version      1.0.2
+// @description  Compare individual inventory weapon and armor stats with the equipped or chosen item in the same slot. Includes temporary effects, coverage, settings and diagnostics.
+// @author       ShavedW00kie (Torn: ThaWookie [2954173] )
+// @license      BSD-3-Clause
+// @homepageURL  https://github.com/ShavedW00kie/
+// @supportURL   https://greasyfork.org/en/users/1597765-shavedw00kie
+// @match        https://www.torn.com/item.php*
+// @match        https://torn.com/item.php*
+// @run-at       document-end
+// @noframes
+// @grant        GM_info
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
+// @grant        GM_registerMenuCommand
+// @grant        GM.getValue
+// @grant        GM.setValue
+// @grant        GM.deleteValue
+// @grant        GM.xmlHttpRequest
+// @grant        GM.setClipboard
+// @grant        GM.registerMenuCommand
+// @connect      api.torn.com
+// ==/UserScript==
+
+/*
+ * Copyright (c) 2026 ShavedW00kie. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ * Full BSD-3-Clause terms are reproduced in the bundled source modules below.
+ *
+ * Data: intrinsic per-UID ratings from Torn API v2 itemdetails/equipment.
+ * Catalog: weapon category, unmodified rounds-per-turn range, body-area coverage,
+ * fixed stackable temporary ratings and effect descriptions. No estimated rolls.
+ * No attacks, equipping, item use, or background game actions are performed.
+ * API credentials go only to https://api.torn.com. No analytics or remote code.
+ * Request timers below are exclusively API pacing/timeouts, never DOM polling.
+ */
+(function (GM_info) {
+    "use strict";
+
+    const MyDebug = initializeModularDebugger(GM_info.script.name);
+    const VERSION = "1.0.2";
+    const P = "tw-ic-";
+    if (document.getElementById(P + "active")) return;
+    const marker = document.createElement("meta");
+    marker.id = P + "active";
+    (document.head || document.documentElement).appendChild(marker);
+
+    const API = "https://api.torn.com/v2/";
+    const TTL = { catalog: 86400000, detail: 21600000, inventory: 3600000 };
+    const DEFAULTS = Object.freeze({
+        enabled: true, showValues: true, showDeltas: false, showRoF: true,
+        showEffects: true, fontSize: 11, upColor: "#79e6a5", downColor: "#99d9ff",
+        referenceMode: "equipped", coverageArea: "slot", armorSlots: {}
+    });
+    const GROUPS = ["Primary", "Secondary", "Melee", "Temporary", "head", "body", "hands", "legs", "feet", "fullbody"];
+    const SLOT_AREA = { head: "Head", body: "Chest", hands: "Hand", legs: "Leg", feet: "Foot", fullbody: "Full Body" };
+    const AREAS = ["Full Body", "Head", "Throat", "Heart", "Chest", "Stomach", "Arm", "Hand", "Groin", "Leg", "Foot"];
+    const AREA_SHORT = { "Full Body": "All", Head: "Hd", Throat: "Th", Heart: "Ht", Chest: "Ch", Stomach: "St", Arm: "Ar", Hand: "Ha", Groin: "Gr", Leg: "Le", Foot: "Ft" };
+    const ROWS = 'li[data-item],li[data-itemid],[data-uid][data-item-id],[data-armoryid][data-item]';
+    const state = {
+        opts: { ...DEFAULTS }, key: "", epoch: 0, queue: Promise.resolve(), writes: Promise.resolve(),
+        catalogs: new Map(), details: new Map(), inventories: new Map(), equipment: [],
+        equipmentAt: 0, equipmentWanted: true, equipmentFailedAt: 0,
+        root: null, rows: [], rowModels: new WeakMap(), pins: new Map(),
+        toolbar: null, statusText: null, baselineText: null, modal: null, support: null,
+        discovery: null, inventoryObserver: null, frame: 0, hydrating: false, again: false,
+        blocked: "", blockedUntil: 0, failures: new Map(), catalogAttempts: new Map(),
+        progress: "", notice: "", autoOpened: false, alive: true, requestAbort: new AbortController(),
+        previousFocus: null, scanned: 0, loaded: 0, lastReferences: "", fallbackStorage: false
+    };
+
+    const number = value => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
+    const uidOf = value => /^\d+$/.test(String(value == null ? "" : value)) && Number(value) > 0 ? String(value) : "";
+    const fmt = value => number(value) === null ? "?" : Number(value).toFixed(2).replace(/\.00$/, "");
+    const fresh = (entry, ttl) => Boolean(entry && Number.isFinite(entry.at) && Date.now() - entry.at >= 0 && Date.now() - entry.at < ttl);
+    const clean = value => String(value || "").replace(/\s+/g, " ").trim();
+    function el(tag, text, cls) {
+        const node = document.createElement(tag);
+        if (text !== undefined && text !== null) node.textContent = text;
+        if (cls) node.className = cls;
+        return node;
+    }
+    function button(text, action, cls = P + "button") {
+        const node = el("button", text, cls); node.type = "button";
+        node.addEventListener("click", event => { event.preventDefault(); event.stopPropagation(); action.call(node, event); });
+        return node;
+    }
+    function link(text, href) {
+        const node = el("a", text); node.href = href; node.target = "_blank"; node.rel = "noopener noreferrer"; return node;
+    }
+    function log(event, data = {}, level = "INFO") { MyDebug.log({ event, ...data }, level); }
+
+    /* Storage prefers the userscript manager. Keys fall back to sessionStorage,
+       never page localStorage. Inventory and item caches stay in sessionStorage
+       in WebViews without manager storage. */
+    async function readStore(name, fallback) {
+        const key = P + name;
+        try {
+            if (typeof GM_getValue === "function") return await GM_getValue(key, fallback);
+            if (typeof GM !== "undefined" && typeof GM.getValue === "function") return await GM.getValue(key, fallback);
+        } catch (_) { log("Storage read fallback", { field: name }, "WARN"); }
+        state.fallbackStorage = true;
+        try { const raw = sessionStorage.getItem(key); return raw === null ? fallback : JSON.parse(raw); }
+        catch (_) { return fallback; }
+    }
+    async function writeStore(name, value) {
+        const key = P + name;
+        try {
+            if (typeof GM_setValue === "function") { await GM_setValue(key, value); return true; }
+            if (typeof GM !== "undefined" && typeof GM.setValue === "function") { await GM.setValue(key, value); return true; }
+        } catch (_) { log("Storage write fallback", { field: name }, "WARN"); }
+        state.fallbackStorage = true;
+        try { sessionStorage.setItem(key, JSON.stringify(value)); return true; }
+        catch (_) { state.notice = "Storage unavailable. Settings and key remain in memory for this page."; return false; }
+    }
+    async function removeStore(name) {
+        try { sessionStorage.removeItem(P + name); } catch (_) {}
+        try {
+            if (typeof GM_deleteValue === "function") { await GM_deleteValue(P + name); return; }
+            if (typeof GM !== "undefined" && typeof GM.deleteValue === "function") { await GM.deleteValue(P + name); return; }
+            await writeStore(name, null);
+        } catch (_) { log("Storage removal failed", { field: name }, "WARN"); }
+    }
+    function sanitizeOptions(input) {
+        const o = { ...DEFAULTS };
+        if (!input || typeof input !== "object") return o;
+        for (const k of ["enabled", "showValues", "showDeltas", "showRoF", "showEffects"]) if (typeof input[k] === "boolean") o[k] = input[k];
+        if (["equipped", "selected"].includes(input.referenceMode)) o.referenceMode = input.referenceMode;
+        if (["slot", ...AREAS].includes(input.coverageArea)) o.coverageArea = input.coverageArea;
+        o.fontSize = Math.max(9, Math.min(15, number(input.fontSize) || 11));
+        for (const k of ["upColor", "downColor"]) if (/^#[0-9a-f]{6}$/i.test(input[k])) o[k] = input[k];
+        if (input.armorSlots && typeof input.armorSlots === "object") {
+            o.armorSlots = Object.fromEntries(Object.entries(input.armorSlots).filter(([id, g]) => /^\d+$/.test(id) && Object.keys(SLOT_AREA).includes(g)));
+        }
+        return o;
+    }
+    function saveOptions() { const snapshot = structuredCopy(state.opts); state.writes = state.writes.then(() => writeStore("options", snapshot)); }
+    function structuredCopy(value) { return JSON.parse(JSON.stringify(value)); }
+    async function saveCache() {
+        const value = { schema: 1, catalogs: [...state.catalogs], details: [...state.details].slice(-4000), inventories: [...state.inventories] };
+        state.writes = state.writes.then(() => writeStore("cache", value)); await state.writes;
+    }
+
+    /* Shared pacing: at most 18 script requests in any rolling minute, with a
+       3.4s gap. navigator.locks serializes reservations across same-origin tabs.
+       Other scripts share Torn's 100/min limit, so this cannot reserve their use. */
+    async function reserveRequest() {
+        const reserve = () => {
+            const now = Date.now(); let times = [];
+            try { times = JSON.parse(localStorage.getItem(P + "api-times") || "[]"); } catch (_) {}
+            if (!Array.isArray(times)) times = [];
+            times = times.filter(t => Number.isFinite(t) && t > now - 60000 && t < now + 3600000).sort((a, b) => a - b);
+            const at = Math.max(now, (times.at(-1) || 0) + 3400, times.length >= 18 ? times[times.length - 18] + 60020 : 0);
+            times.push(at);
+            try { localStorage.setItem(P + "api-times", JSON.stringify(times)); } catch (_) {}
+            return at;
+        };
+        return navigator.locks && navigator.locks.request ? navigator.locks.request(P + "api-lock", reserve) : reserve();
+    }
+    function networkDelay(ms, signal) {
+        if (ms <= 0) return Promise.resolve();
+        return new Promise((resolve, reject) => {
+            if (signal.aborted) { reject(new Error("Request canceled")); return; }
+            const abort = () => { clearTimeout(timer); reject(new Error("Request canceled")); };
+            const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, ms);
+            signal.addEventListener("abort", abort, { once: true });
+        });
+    }
+    function transport(url, key, signal) {
+        const request = typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest :
+            typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function" ? GM.xmlHttpRequest.bind(GM) : null;
+        if (request) return new Promise((resolve, reject) => {
+            let handle; let settled = false;
+            const done = (error, response) => {
+                if (settled) return; settled = true; signal.removeEventListener("abort", abort);
+                if (error) reject(error); else resolve(response);
+            };
+            const abort = () => { if (handle && handle.abort) handle.abort(); done(new Error("Request canceled")); };
+            if (signal.aborted) { done(new Error("Request canceled")); return; }
+            signal.addEventListener("abort", abort, { once: true });
+            try {
+                handle = request({ method: "GET", url, anonymous: true, timeout: 20000,
+                    headers: { Authorization: "ApiKey " + key, Accept: "application/json" },
+                    onload: r => {
+                        if (r.finalUrl && new URL(r.finalUrl).origin !== "https://api.torn.com") { done(new Error("Unexpected API redirect")); return; }
+                        done(null, { status: r.status, text: r.responseText });
+                    },
+                    onerror: () => done(new Error("Torn API connection failed")),
+                    ontimeout: () => done(new Error("Torn API timeout")),
+                    onabort: () => done(new Error("Request canceled"))
+                });
+                if (handle && typeof handle.catch === "function") handle.catch(() => done(new Error("Torn API connection failed")));
+            } catch (_) { done(new Error("Userscript request bridge failed")); }
+        });
+        // TornPDA's documented native GET bridge bypasses WebView CORS limits.
+        if (window.flutter_inappwebview && typeof window.flutter_inappwebview.callHandler === "function") {
+            return new Promise((resolve, reject) => {
+                let settled = false;
+                const done = (error, value) => {
+                    if (settled) return; settled = true; clearTimeout(timer); signal.removeEventListener("abort", abort);
+                    if (error) reject(error); else resolve(value);
+                };
+                const abort = () => done(new Error("Request canceled"));
+                const timer = setTimeout(() => done(new Error("TornPDA API timeout")), 20000);
+                if (signal.aborted) { abort(); return; }
+                signal.addEventListener("abort", abort, { once: true });
+                Promise.resolve().then(() => window.flutter_inappwebview.callHandler("PDA_httpGet", url,
+                    { Authorization: "ApiKey " + key, Accept: "application/json" }))
+                    .then(response => {
+                        if (!response || typeof response !== "object" || number(response.status) === null) {
+                            done(new Error("Unexpected TornPDA HTTP response")); return;
+                        }
+                        done(null, { status: Number(response.status), text: String(response.responseText || "") });
+                    }, () => done(new Error("TornPDA API connection failed")));
+            });
+        }
+        return (async () => {
+            const controller = new AbortController();
+            const abort = () => controller.abort(); signal.addEventListener("abort", abort, { once: true });
+            if (signal.aborted) controller.abort();
+            const timer = setTimeout(() => controller.abort(), 20000); // Network timeout only.
+            try {
+                const r = await fetch(url, { method: "GET", headers: { Authorization: "ApiKey " + key, Accept: "application/json" },
+                    credentials: "omit", redirect: "error", signal: controller.signal });
+                return { status: r.status, text: await r.text() };
+            } catch (_) { throw new Error("Torn API fetch failed. Check connectivity or the TornPDA request bridge."); }
+            finally { clearTimeout(timer); signal.removeEventListener("abort", abort); }
+        })();
+    }
+    function api(path, query = {}) {
+        const epoch = state.epoch;
+        const job = async () => {
+            if (epoch !== state.epoch || !state.key) throw new Error("Request canceled");
+            if (state.blocked) throw new Error(state.blocked);
+            if (Date.now() < state.blockedUntil) throw new Error("API cooling down. Retry with Refresh after " + new Date(state.blockedUntil).toLocaleTimeString());
+            const signal = state.requestAbort.signal;
+            const at = await reserveRequest(); await networkDelay(at - Date.now(), signal);
+            if (epoch !== state.epoch || signal.aborted) throw new Error("Request canceled");
+            const url = new URL(path, API);
+            if (url.origin !== "https://api.torn.com" || !url.pathname.startsWith("/v2/")) throw new Error("Invalid API destination");
+            for (const [k, v] of Object.entries({ ...query, comment: "TornInventoryCompare" })) url.searchParams.set(k, String(v));
+            log("API request", { path: url.pathname });
+            const r = await transport(url.href, state.key, signal);
+            if (epoch !== state.epoch) throw new Error("Request canceled");
+            if (r.status === 429) { state.blockedUntil = Date.now() + 65000; throw new Error("Torn rate limit reached. Refresh after one minute."); }
+            if (r.status !== 200) { state.blockedUntil = Date.now() + 30000; throw new Error("Torn API HTTP " + r.status); }
+            let data; try { data = JSON.parse(r.text); } catch (_) { throw new Error("Torn API returned invalid JSON"); }
+            if (data.error) {
+                const code = number(data.error.code);
+                log("API rejected request", { path: url.pathname, code }, "WARN");
+                if ([1, 2, 8, 9, 10, 13, 16, 18].includes(code)) state.blocked = "API error " + code + ": check the key, permissions or account API access in settings.";
+                if ([5, 14].includes(code)) state.blockedUntil = Date.now() + (code === 14 ? 3600000 : 65000);
+                throw new Error(state.blocked || "Torn API error " + code + ". Refresh later to retry.");
+            }
+            return data;
+        };
+        const result = state.queue.then(job); state.queue = result.catch(() => {}); return result;
+    }
+
+    function catalogEntry(id) {
+        for (const cat of state.catalogs.values()) {
+            const item = cat.items.find(i => String(i.id) === String(id)); if (item) return item;
+        }
+        return null;
+    }
+    function armorSlot(item) {
+        if (!item || item.type !== "Armor") return "";
+        if (state.opts.armorSlots[String(item.id)]) return state.opts.armorSlots[String(item.id)];
+        const name = String(item.name || "");
+        if (/hazmat|full[ -]?body suit/i.test(name)) return "fullbody";
+        if (/helmet|mask|respirator|visage/i.test(name)) return "head";
+        if (/gloves?|gauntlets?/i.test(name)) return "hands";
+        if (/pants|trousers|leggings|greaves/i.test(name)) return "legs";
+        if (/boots?|shoes?|sabatons/i.test(name)) return "feet";
+        if (/vest|body|apron|jacket|chain mail|armor|armour|carapace/i.test(name)) return "body";
+        return ""; // Unrecognized new armor requires an explicit slot override.
+    }
+    function groupOf(item) {
+        if (!item) return "";
+        if (item.type === "Armor") return armorSlot(item);
+        const category = item.details && item.details.category;
+        return ["Primary", "Secondary", "Melee", "Temporary"].includes(category) ? category : "";
+    }
+    function detailEntries(data) {
+        const value = data && data.itemdetails;
+        if (Array.isArray(value)) return value;
+        if (value && uidOf(value.uid)) return [value]; // Deprecated single-UID object.
+        if (value && typeof value === "object") return Object.values(value).filter(v => v && uidOf(v.uid));
+        return [];
+    }
+    function statRecord(raw, at = Date.now()) {
+        if (!raw || !uidOf(raw.uid)) return null;
+        const s = raw.stats || {};
+        return { id: uidOf(raw.id), uid: uidOf(raw.uid), name: clean(raw.name),
+            damage: number(s.damage), accuracy: number(s.accuracy), armor: number(s.armor), quality: number(s.quality),
+            bonuses: Array.isArray(raw.bonuses) ? raw.bonuses : [], at };
+    }
+    function statsFor(model) {
+        const catalog = catalogEntry(model.id);
+        if (model.uid) {
+            const detail = state.details.get(model.uid);
+            if (detail && String(detail.id) === String(model.id)) {
+                const isArmor = catalog && catalog.type === "Armor";
+                const usable = isArmor ? number(detail.armor) !== null : number(detail.damage) !== null || number(detail.accuracy) !== null;
+                if (usable) return { ...detail, source: "Individual UID", stale: !fresh(detail, TTL.detail) };
+            }
+        }
+        if (groupOf(catalog) === "Temporary") {
+            const base = catalog.details && catalog.details.base_stats;
+            // Temporary stacks have fixed catalog ratings, not weapon quality rolls.
+            if (base) return { damage: number(base.damage), accuracy: number(base.accuracy), armor: null, source: "Fixed temporary rating", at: 0, stale: false };
+        }
+        return null;
+    }
+    function isEquipped(row) {
+        if (row.getAttribute("data-equipped") === "true" || row.getAttribute("data-equipped") === "1") return true;
+        if (/(?:^|\s)(?:equipped|is-equipped|item-equipped)(?:\s|$)/.test(row.className)) return true;
+        return Boolean(row.querySelector('.option-unequip,[data-action="unequip"],.equipped:not([data-tw-ic-owned])'));
+    }
+    function readRow(row) {
+        const id = uidOf(row.getAttribute("data-item") || row.getAttribute("data-itemid") || row.getAttribute("data-item-id"));
+        if (!id) return null;
+        let uid = "";
+        const attrs = ["data-armoryid", "data-armouryid", "data-armory", "data-armoury", "data-uid"];
+        const identityNode = row.querySelector(attrs.map(a => "[" + a + "]").join(","));
+        for (const node of [row, identityNode]) {
+            if (!node) continue;
+            for (const a of attrs) { uid = uidOf(node.getAttribute(a)); if (uid) break; }
+            if (uid) break;
+        }
+        const weak = uidOf(row.getAttribute("data-id"));
+        if (!uid && weak) {
+            // data-id is used for several purposes. Accept only a matching inventory UID.
+            for (const inv of state.inventories.values()) {
+                if (inv.items.some(i => uidOf(i.uid) === weak && String(i.id) === id)) { uid = weak; break; }
+            }
+        }
+        const nameNode = row.querySelector(".name-wrap > .name,.name-wrap .name,.name,[data-item-name]");
+        const catalog = catalogEntry(id);
+        const name = catalog ? catalog.name : clean(nameNode ? [...nameNode.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join(" ") : "Item " + id);
+        return { id, uid, weak, name: name || "Item " + id, row, group: groupOf(catalog), equipped: isEquipped(row) };
+    }
+    function inventoryCategory(group) { return Object.keys(SLOT_AREA).includes(group) ? "Defensive" : group; }
+    function rowHost(row) { return row.querySelector(".name-wrap") || row.querySelector("li.desc,.desc,.name") || row; }
+    function findRoot() { return document.querySelector("div.items-wrap,.items-wrap,#all-items"); }
+    function owned(node) { const e = node && (node.nodeType === 1 ? node : node.parentElement); return Boolean(e && e.closest && e.closest("[data-tw-ic-owned]")); }
+    function schedule() {
+        if (!state.alive || state.frame) return;
+        state.frame = requestAnimationFrame(() => { state.frame = 0; scanAndRender(); });
+    }
+    function attachRoot(root) {
+        if (state.root === root) return;
+        if (state.inventoryObserver) state.inventoryObserver.disconnect();
+        state.root = root;
+        if (!root) return;
+        state.inventoryObserver = new MutationObserver(records => {
+            if (records.some(m => !owned(m.target) && (m.type !== "childList" || [...m.addedNodes, ...m.removedNodes].some(n => !owned(n))))) schedule();
+        });
+        state.inventoryObserver.observe(root, { childList: true, subtree: true, attributes: true, characterData: true,
+            attributeFilter: ["class", "data-equipped", "data-id", "data-uid", "data-item", "data-itemid", "data-armoryid", "data-armoury", "hidden", "aria-selected"] });
+        log("Inventory container found", { selector: root.id ? "#" + root.id : ".items-wrap" });
+    }
+    function references(models) {
+        const result = new Map();
+        for (const group of GROUPS) {
+            const pin = state.pins.get(group);
+            if (pin) {
+                const visible = models.find(m => pin.uid ? m.uid === pin.uid && m.id === pin.id : m.id === pin.id && m.group === "Temporary");
+                if (visible) { result.set(group, { ...visible, referenceSource: "Chosen" }); continue; }
+                // Never retain a manual pin for an item no longer in the visible list.
+                if (models.some(m => m.group === group)) state.pins.delete(group);
+            }
+            if (state.opts.referenceMode === "selected") continue;
+            const marked = models.filter(m => m.group === group && m.equipped);
+            if (marked.length === 1) { result.set(group, { ...marked[0], referenceSource: "Equipped on page" }); continue; }
+            if (marked.length > 1) continue;
+            const equipped = state.equipment.filter(raw => groupOf(catalogEntry(raw.id)) === group);
+            if (equipped.length === 1) {
+                const raw = equipped[0];
+                const sameVisible = models.find(m => m.uid && m.uid === uidOf(raw.uid));
+                // Explicit current page state wins over the API's service cache.
+                if (sameVisible && ["false", "0"].includes(sameVisible.row.getAttribute("data-equipped"))) continue;
+                result.set(group, { id: String(raw.id), uid: uidOf(raw.uid), name: raw.name, group, referenceSource: "Equipped via API" });
+            }
+        }
+        return result;
+    }
+    function sameItem(a, b) { return Boolean(a && b && (a.uid && b.uid ? a.uid === b.uid && a.id === b.id : a.group === "Temporary" && b.group === "Temporary" && a.id === b.id)); }
+    function compare(a, b) {
+        if (number(a) === null || number(b) === null) return { symbol: "?", cls: "unknown", text: "comparison unavailable" };
+        const delta = Math.round((a - b) * 100) / 100;
+        return delta > 0 ? { symbol: "↑", cls: "up", text: "higher", delta } : delta < 0 ? { symbol: "↓", cls: "down", text: "lower", delta } : { symbol: "=", cls: "equal", text: "equal", delta: 0 };
+    }
+    function rof(item) {
+        const v = item && item.details && item.details.ammo && item.details.ammo.rate_of_fire;
+        const min = v && number(v.minimum), max = v && number(v.maximum);
+        return min !== null && min !== undefined && max !== null && max !== undefined && min <= max ? { min, max } : null;
+    }
+    function compareRoF(a, b) {
+        if (!a || !b) return { symbol: "?", cls: "unknown", text: "comparison unavailable" };
+        if (a.min === b.min && a.max === b.max) return { symbol: "=", cls: "equal", text: "same rounds-per-turn range" };
+        if (a.min >= b.min && a.max >= b.max) return { symbol: "↑", cls: "up", text: "higher rounds-per-turn range" };
+        if (a.min <= b.min && a.max <= b.max) return { symbol: "↓", cls: "down", text: "lower rounds-per-turn range" };
+        return { symbol: "↕", cls: "equal", text: "mixed range, neither consistently higher nor lower" };
+    }
+    function coverage(item, area) {
+        const list = item && item.details && item.details.coverage;
+        if (!Array.isArray(list) || !list.length) return null;
+        const found = list.find(i => i.name === area);
+        // A nonempty official list enumerates covered parts; omitted parts are uncovered.
+        return found ? number(found.value) : area === "Full Body" ? null : 0;
+    }
+    function effect(item) {
+        const n = String(item && item.name || "").toLowerCase();
+        const text = clean(item && item.effect);
+        const known = [
+            [/pepper spray/, "🌶️", "Maced: enemy dexterity debuff"],
+            [/concussion grenade/, "😵‍💫", "Concussed: enemy dexterity debuff"],
+            [/flash grenade/, "⚡", "Blinded: enemy speed debuff"],
+            [/smoke grenade/, "😶‍🌫️", "Smoked: enemy speed debuff"],
+            [/tear gas/, "😭", "Gassed: enemy dexterity debuff"],
+            [/nerve gas/, "☣️", "Nerve gas"],
+            [/molotov/, "🔥", "Burning: damage over time"],
+            [/bolas/, "🪢", "Ensnared: enemy misses turns"],
+            [/stygian darkness/, "🫥", "Draws an interdimensional opponent into the physical realm"],
+            [/epinephrine/, "💪", "Self buff: strength"],
+            [/melatonin/, "🏃", "Self buff: speed"],
+            [/serotonin/, "🛡️", "Self buff: defense and life restoration"],
+            [/tyrosine/, "🎯", "Self buff: dexterity"],
+            [/glitter bomb|party popper/, "🎉", "Decorative visual effect"],
+            [/grenade|heg|nail bomb|claymore|fireworks/, "💥", "Explosive damage"]
+        ];
+        const found = known.find(([rx]) => rx.test(n));
+        if (found) return { symbol: found[1], text: text || found[2], label: found[2] };
+        if (/burn|fire damage/i.test(text)) return { symbol: "🔥", text, label: "Burning effect" };
+        return { symbol: text ? "✦" : "·", text: text || "No special effect reported by the catalog.", label: text ? "See catalog effect" : "No special effect reported" };
+    }
+
+    async function loadCatalog(category, force = false) {
+        const old = state.catalogs.get(category);
+        if (!force && fresh(old, TTL.catalog)) return;
+        const last = state.catalogAttempts.get(category) || 0;
+        if (!force && Date.now() - last < 60000) return;
+        state.catalogAttempts.set(category, Date.now());
+        state.progress = "Loading " + category.toLowerCase() + " reference data"; schedule();
+        const data = await api("torn/items", { cat: category });
+        if (!Array.isArray(data.items)) throw new Error("Unexpected catalog response");
+        state.catalogs.set(category, { items: data.items, at: Date.now() });
+    }
+    async function loadInventory(category, force = false) {
+        if (!category || !["Primary", "Secondary", "Melee", "Temporary", "Defensive"].includes(category)) return;
+        if (!force && fresh(state.inventories.get(category), TTL.inventory)) return;
+        const failureKey = "inventory:" + category;
+        if (!force && Date.now() - (state.failures.get(failureKey) || 0) < 60000) return;
+        const items = []; let offset = 0;
+        try {
+            while (offset < 20000) {
+                state.progress = "Reading " + category.toLowerCase() + " inventory"; schedule();
+                const data = await api("user/inventory", { cat: category, limit: 250, offset });
+                if (!data.inventory || !Array.isArray(data.inventory.items)) throw new Error("Unexpected inventory response");
+                const rows = data.inventory.items; items.push(...rows); offset += rows.length;
+                const metadata = data._metadata || {};
+                if (!rows.length || rows.length < 250 || (number(metadata.total) !== null && offset >= number(metadata.total))) break;
+                if (metadata.links && Object.hasOwn(metadata.links, "next") && !metadata.links.next) break;
+            }
+            state.inventories.set(category, { items, at: Date.now() });
+            if (offset >= 20000) state.notice = "Large inventory: UID fallback list truncated. Direct row UIDs still work.";
+        } catch (e) { state.failures.set(failureKey, Date.now()); throw e; }
+    }
+    async function loadEquipment() {
+        if ((!state.equipmentWanted && state.equipmentAt) || Date.now() - state.equipmentFailedAt < 30000) return;
+        state.equipmentWanted = false;
+        try {
+            state.progress = "Reading equipped items"; schedule();
+            const data = await api("user/equipment");
+            if (!Array.isArray(data.equipment)) throw new Error("Unexpected equipment response");
+            state.equipment = data.equipment; state.equipmentAt = Date.now();
+            for (const raw of data.equipment) { const item = statRecord(raw); if (item) state.details.set(item.uid, item); }
+            log("Equipped items loaded", { count: data.equipment.length });
+        } catch (e) { state.equipmentFailedAt = Date.now(); throw e; }
+    }
+    function currentModels() {
+        if (!state.root) return [];
+        return Array.from(state.root.querySelectorAll(ROWS))
+            .filter(row => !owned(row) && !row.querySelector(ROWS) && row.getClientRects().length > 0)
+            .map(readRow).filter(Boolean);
+    }
+    async function hydrate() {
+        if (!state.key || !state.opts.enabled || state.blocked || Date.now() < state.blockedUntil) return;
+        if (state.hydrating) { state.again = true; return; }
+        state.hydrating = true; const epoch = state.epoch;
+        try {
+            await loadCatalog("Weapon");
+            await loadCatalog("Armor");
+            await loadEquipment();
+            if (epoch !== state.epoch) return;
+            let models = currentModels();
+            // Inventory is a fallback only for ambiguous data-id attributes, not
+            // a way to assign duplicate copies by their display order or names.
+            const needsInventory = [...new Set(models.filter(m => !m.uid && m.weak && m.group !== "Temporary").map(m => inventoryCategory(m.group)))];
+            for (const category of needsInventory) {
+                try { await loadInventory(category); }
+                catch (e) { log("Inventory fallback unavailable", { category, message: e.message }, "WARN"); if (state.blocked || epoch !== state.epoch) throw e; }
+            }
+            models = currentModels();
+            const refs = references(models);
+            const wanted = [...refs.values(), ...models];
+            const requested = new Set();
+            const pending = [];
+            for (const model of wanted) {
+                if (!model.uid || requested.has(model.uid)) continue;
+                const record = state.details.get(model.uid);
+                if (fresh(record, TTL.detail) && record.id === model.id) continue;
+                if (Date.now() - (state.failures.get(model.uid) || 0) < 60000) continue;
+                requested.add(model.uid); pending.push(model);
+            }
+            let completed = 0;
+            for (let i = 0; i < pending.length; i += 25) {
+                if (epoch !== state.epoch || !state.opts.enabled) return;
+                // Stop obsolete category work if React replaced the inventory.
+                const visible = currentModels();
+                const stillNeeded = new Set([...visible, ...references(visible).values()].map(m => m.uid).filter(Boolean));
+                const batch = pending.slice(i, i + 25).filter(m => stillNeeded.has(m.uid));
+                if (!batch.length) continue;
+                state.progress = "Loading individual stats: " + completed + "/" + pending.length; schedule();
+                try {
+                    const data = await api("torn/" + batch.map(m => m.uid).join(",") + "/itemdetails");
+                    const entries = detailEntries(data); const accepted = new Set();
+                    for (const raw of entries) {
+                        const record = statRecord(raw);
+                        if (!record) continue;
+                        const expected = batch.find(m => m.uid === record.uid && m.id === record.id);
+                        if (!expected) { log("UID response mismatch ignored", { uid: record.uid, itemId: record.id }, "WARN"); continue; }
+                        state.details.set(record.uid, record); accepted.add(record.uid);
+                    }
+                    for (const m of batch) if (!accepted.has(m.uid)) state.failures.set(m.uid, Date.now());
+                    completed += batch.length;
+                    log("Individual stats loaded", { requested: batch.length, accepted: accepted.size }); schedule();
+                } catch (e) {
+                    for (const m of batch) state.failures.set(m.uid, Date.now());
+                    log("Individual stats unavailable", { count: batch.length, message: e.message }, "WARN");
+                    throw e;
+                }
+            }
+            if (epoch === state.epoch) { state.notice = ""; await saveCache(); }
+        } catch (e) {
+            if (epoch === state.epoch && e.message !== "Request canceled") { state.notice = e.message; log("Data refresh stopped", { message: e.message }, "WARN"); }
+        } finally {
+            state.progress = ""; state.hydrating = false; schedule();
+            if (state.again) { state.again = false; /* Next relevant render checks only uncached work. */ }
+        }
+    }
+    function needsHydration(models) {
+        if (!state.key || !state.opts.enabled || state.hydrating || state.blocked || Date.now() < state.blockedUntil) return false;
+        if (["Weapon", "Armor"].some(c => !fresh(state.catalogs.get(c), TTL.catalog) && Date.now() - (state.catalogAttempts.get(c) || 0) >= 60000)) return true;
+        if ((state.equipmentWanted || !state.equipmentAt) && Date.now() - state.equipmentFailedAt >= 30000) return true;
+        if (models.some(m => !m.uid && m.weak && m.group && m.group !== "Temporary" && !fresh(state.inventories.get(inventoryCategory(m.group)), TTL.inventory) && Date.now() - (state.failures.get("inventory:" + inventoryCategory(m.group)) || 0) >= 60000)) return true;
+        return [...models, ...references(models).values()].some(m => m.uid && (!fresh(state.details.get(m.uid), TTL.detail) || state.details.get(m.uid).id !== m.id) && Date.now() - (state.failures.get(m.uid) || 0) >= 60000);
+    }
+
+    function applyTheme() {
+        const css = `:root{--tw-ic-up:${state.opts.upColor};--tw-ic-down:${state.opts.downColor};--tw-ic-size:${state.opts.fontSize}px}`;
+        let node = document.getElementById(P + "theme");
+        if (!node) { node = el("style"); node.id = P + "theme"; node.setAttribute("data-tw-ic-owned", "theme"); (document.head || document.documentElement).appendChild(node); }
+        if (node.textContent !== css) node.textContent = css;
+    }
+    function styles() {
+        if (document.getElementById(P + "styles")) return;
+        const node = el("style"); node.id = P + "styles"; node.setAttribute("data-tw-ic-owned", "style");
+        node.textContent = `
+        .${P}wrap{display:inline-flex;max-width:100%;margin:2px 0 2px 8px;vertical-align:middle;line-height:1.3;float:none}
+        .${P}chip{display:flex!important;flex-direction:column;align-items:flex-start;gap:1px;max-width:100%;min-height:28px;
+          margin:0!important;padding:2px 4px!important;border:0!important;border-radius:4px;background:#171c20e8!important;
+          color:#edf4f7!important;font:var(--tw-ic-size,11px)/1.35 Arial,sans-serif!important;text-transform:none!important;
+          text-shadow:none!important;cursor:pointer;box-shadow:none!important;white-space:normal;touch-action:manipulation}
+        .${P}line{display:flex;align-items:center;flex-wrap:wrap;gap:8px;max-width:100%}
+        .${P}metric{display:inline-flex;align-items:center;gap:3px;white-space:nowrap;font-variant-numeric:tabular-nums}
+        .${P}arrow{font-family:Arial,sans-serif;font-weight:700;font-size:1.25em;line-height:1}
+        .${P}up{color:var(--tw-ic-up,#79e6a5)!important}.` + P + `down{color:var(--tw-ic-down,#99d9ff)!important}
+        .${P}equal{color:#d5dce1!important}.` + P + `unknown{color:#c9c1a7!important}
+        .${P}rof{font-size:.86em;opacity:.95}.` + P + `delta{font-size:.9em;opacity:.85}
+        .${P}toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:34px;margin:4px 0;
+          padding:2px 5px;box-sizing:border-box;color:#dbe6ed;background:#22292fd9;border-radius:5px;font:11px/1.3 Arial,sans-serif;clear:both}
+        .${P}toolbar>div{min-width:0;overflow-wrap:anywhere}
+        .${P}toolbar small{display:block;color:#b4c7d2;font-size:10px;overflow-wrap:anywhere}
+        .${P}gear{flex-shrink:0;width:34px;min-height:32px;padding:0;border:1px solid #77828b;border-radius:6px;
+          background:#222b31;color:#ebf7ff;font-size:21px;cursor:pointer;touch-action:manipulation}
+        .${P}fallback{position:fixed;right:12px;bottom:145px;z-index:2147483630}
+        .${P}overlay{position:fixed;inset:0;z-index:2147483640;display:flex;align-items:center;justify-content:center;
+          background:#000a;padding:12px;box-sizing:border-box;isolation:isolate}
+        .${P}panel{box-sizing:border-box;display:flex;flex-direction:column;gap:12px;width:min(560px,100%);max-height:88vh;
+          max-height:88dvh;overflow:auto;background:#20262b;color:#edf5f8;border:1px solid #71838f;border-radius:12px;
+          padding:16px;font:13px/1.5 Arial,sans-serif;box-shadow:0 10px 40px #000b;overscroll-behavior:contain;text-align:left}
+        .${P}panel *{box-sizing:border-box}.` + P + `panel h2{font:700 18px/1.3 Arial,sans-serif;margin:0;color:#f3f8fb}
+        .${P}panel h3{font:700 14px/1.4 Arial,sans-serif;margin:4px 0;color:#edf5f8}.` + P + `panel p{margin:0}
+        .${P}panel a{color:#a7dfff!important;text-decoration:underline!important}.` + P + `panel small{color:#bdcbd4}
+        .${P}panel [hidden]{display:none!important}.` + P + `panel input:not([type=checkbox]):not([type=color]),.${P}panel select{
+          width:100%;min-height:36px;background:#111a20;color:#f1f5f9;border:1px solid #738694;border-radius:5px;padding:6px;font:inherit}
+        .${P}panel input[type=checkbox]{width:18px;height:18px;flex-shrink:0}.` + P + `panel input[type=color]{width:48px;height:34px}
+        .${P}field{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:34px}
+        .${P}stack{display:flex;flex-direction:column;gap:6px}.` + P + `actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+        .${P}button{min-height:36px;border:1px solid #708a9b;border-radius:6px;padding:6px 10px;background:#304550;
+          color:#fff;font:13px/1.3 Arial,sans-serif;cursor:pointer;text-transform:none;touch-action:manipulation}
+        .${P}panel button:focus-visible,.${P}gear:focus-visible,.${P}chip:focus-visible{outline:2px solid #b0e6ff;outline-offset:2px}
+        .${P}muted{color:#bdcbd4;font-size:12px}.` + P + `table{width:100%;border-collapse:collapse;font:12px/1.4 Arial,sans-serif}
+        .${P}table th,.${P}table td{padding:5px;text-align:left;border-bottom:1px solid #4b5962;color:#eff7fb}
+        .${P}callout{padding:9px;background:#14202a;border:1px solid #415c70;border-radius:6px;overflow-wrap:anywhere}
+        #${P}support{position:static!important;inset:auto!important;z-index:auto!important;width:100%!important;display:flex!important;
+          flex-direction:column!important;gap:8px!important;margin:4px 0!important}
+        #${P}support .tw-support-btn{max-width:100%;min-width:0}
+        @media(max-width:480px){.${P}wrap{margin-left:5px}.${P}chip{padding:1px 3px!important}.${P}line{gap:5px}
+          .${P}overlay{padding:8px}.${P}panel{padding:12px;max-height:90vh;max-height:90dvh}}
+        `;
+        (document.head || document.documentElement).appendChild(node); applyTheme();
+    }
+    function ensureToolbar() {
+        if (!state.toolbar) {
+            const bar = el("div", null, P + "toolbar"); bar.id = P + "toolbar"; bar.setAttribute("data-tw-ic-owned", "toolbar");
+            const text = el("div"); state.baselineText = el("span"); state.statusText = el("small"); text.append(state.baselineText, state.statusText);
+            const gear = button("⚙", openSettings, P + "gear"); gear.title = "Inventory Compare settings"; gear.setAttribute("aria-label", "Open Inventory Compare settings");
+            bar.append(text, gear); state.toolbar = bar;
+        }
+        const bar = state.toolbar;
+        if (state.root && state.root.parentElement) {
+            bar.classList.remove(P + "fallback");
+            if (bar.nextElementSibling !== state.root) state.root.before(bar);
+        } else if (!bar.isConnected) { bar.classList.add(P + "fallback"); document.body.appendChild(bar); }
+    }
+    function metric(label, value, baseline, percent = false) {
+        const node = el("span", null, P + "metric"); const c = compare(value, baseline);
+        node.append(el("span", label + (state.opts.showValues ? " " + fmt(value) + (percent && number(value) !== null ? "%" : "") : "")));
+        const arrow = el("span", c.symbol, P + "arrow " + P + c.cls); arrow.setAttribute("aria-hidden", "true"); node.append(arrow);
+        if (state.opts.showDeltas && c.delta !== undefined && c.delta !== 0) node.append(el("small", (c.delta > 0 ? "+" : "") + fmt(c.delta), P + "delta"));
+        node.setAttribute("aria-label", label + " " + fmt(value) + (percent ? " percent" : "") + ", " + c.text + (number(baseline) !== null ? " than " + fmt(baseline) : ""));
+        return node;
+    }
+    function renderRow(model, ref) {
+        const row = model.row; let wrap = Array.from(row.querySelectorAll("." + P + "wrap")).find(n => n.closest(ROWS) === row);
+        const cat = catalogEntry(model.id);
+        if ((!model.group && !(cat && cat.type === "Armor")) || !state.opts.enabled) { if (wrap) wrap.remove(); return; }
+        const actual = statsFor(model); const base = ref && statsFor(ref);
+        const area = state.opts.coverageArea === "slot" ? SLOT_AREA[model.group] : state.opts.coverageArea;
+        const sig = JSON.stringify([model.id, model.uid, actual, ref && [ref.id, ref.uid], base, state.opts, cat && cat.details, model.equipped]);
+        if (wrap && wrap.getAttribute("data-signature") === sig) { state.rowModels.set(row, model); return; }
+        if (!wrap) {
+            wrap = el("span", null, P + "wrap"); wrap.setAttribute("data-tw-ic-owned", "row"); rowHost(row).appendChild(wrap);
+        }
+        wrap.setAttribute("data-signature", sig); wrap.replaceChildren(); state.rowModels.set(row, model);
+        const chip = button("", () => openDetails(model, ref), P + "chip");
+        const line = el("span", null, P + "line"); const baseline = sameItem(model, ref);
+        if (model.group === "Temporary") {
+            line.append(metric("D", actual && actual.damage, base && base.damage));
+            if (state.opts.showEffects) { const e = effect(cat); const icon = el("span", e.symbol); icon.title = e.label; icon.setAttribute("aria-label", e.label); line.append(icon); }
+        } else if (cat && cat.type === "Armor") {
+            line.append(metric("AR", actual && actual.armor, base && base.armor));
+            if (model.group) line.append(metric("C(" + (AREA_SHORT[area] || "?") + ")", coverage(cat, area), ref ? coverage(catalogEntry(ref.id), area) : null, true));
+            else line.append(el("small", "Choose armor slot", P + "muted"));
+        } else {
+            line.append(metric("D", actual && actual.damage, base && base.damage), metric("A", actual && actual.accuracy, base && base.accuracy));
+        }
+        if (baseline) { const b = el("span", "◎", P + "equal"); b.setAttribute("aria-label", "Reference item"); line.append(b); }
+        chip.append(line);
+        const rate = rof(cat);
+        if (state.opts.showRoF && rate && model.group !== "Temporary") {
+            const c = compareRoF(rate, ref && rof(catalogEntry(ref.id)));
+            const small = el("small", null, P + "rof " + P + "metric");
+            small.append(el("span", "RoF " + rate.min + (rate.min !== rate.max ? "-" + rate.max : "")), el("span", c.symbol, P + "arrow " + P + c.cls));
+            small.title = c.text + "; unmodified rounds per turn. Tap for details."; chip.append(small);
+        }
+        if (!actual || actual.stale || !ref) chip.append(el("small", !actual ? (model.uid ? "Stats pending" : "UID needed") : actual.stale ? "Cached stats" : "Choose reference", P + "muted"));
+        chip.title = model.name + (ref ? " vs " + ref.name : ": no reference yet") + ". Tap for details or choose a reference.";
+        chip.setAttribute("aria-label", chip.title); wrap.append(chip);
+    }
+    function scanAndRender() {
+        if (!state.alive || !document.body) return;
+        styles(); attachRoot(findRoot()); ensureToolbar();
+        const models = currentModels(); state.rows = models;
+        const refs = references(models);
+        const groups = [...new Set(models.map(m => m.group).filter(Boolean))];
+        const labels = groups.map(g => refs.has(g) ? (groups.length > 1 ? g + ": " : "") + refs.get(g).name : g + ": choose reference");
+        const title = !state.opts.enabled ? "Inventory Compare paused" : labels.length ? "Compare with: " + labels.join(" | ") : "Inventory Compare";
+        if (state.baselineText.textContent !== title) state.baselineText.textContent = title;
+        const eligible = models.filter(m => m.group || (catalogEntry(m.id) && catalogEntry(m.id).type === "Armor"));
+        state.scanned = eligible.length; state.loaded = eligible.filter(m => statsFor(m)).length;
+        const info = !state.key ? "Tap ⚙ to add a minimal-access Torn API key" : state.blocked || state.progress || state.notice ||
+            state.loaded + "/" + state.scanned + " items have stats · ↑ higher · ↓ lower · = equal · tap stats for details";
+        if (state.statusText.textContent !== info) state.statusText.textContent = info;
+        for (const m of models) renderRow(m, refs.get(m.group));
+        if (title !== state.lastReferences) { state.lastReferences = title; log("Comparison references", { groups: groups.length, rows: models.length }); }
+        if (needsHydration(models)) void hydrate();
+        if (!state.key && !state.autoOpened) { state.autoOpened = true; openSettings(); }
+    }
+
+    function closeModal() {
+        if (state.support) { state.support.destroy(); state.support = null; }
+        if (state.modal) { state.modal.remove(); state.modal = null; }
+        if (state.previousFocus && state.previousFocus.isConnected) { try { state.previousFocus.focus({ preventScroll: true }); } catch (_) {} }
+    }
+    function modal(title) {
+        const previous = state.modal ? state.previousFocus : document.activeElement;
+        closeModal(); state.previousFocus = previous;
+        const overlay = el("div", null, P + "overlay"); overlay.setAttribute("data-tw-ic-owned", "modal"); overlay.id = P + "modal";
+        const panel = el("section", null, P + "panel"); panel.tabIndex = -1; panel.setAttribute("role", "dialog"); panel.setAttribute("aria-modal", "true");
+        const head = el("div", null, P + "actions"); const heading = el("h2", title); heading.id = P + "dialog-title"; heading.style.flex = "1";
+        panel.setAttribute("aria-labelledby", heading.id); head.append(heading, button("Close", closeModal)); panel.append(head); overlay.append(panel);
+        overlay.addEventListener("click", e => { if (e.target === overlay) closeModal(); });
+        overlay.addEventListener("keydown", e => {
+            if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeModal(); return; }
+            if (e.key !== "Tab") return;
+            const nodes = Array.from(panel.querySelectorAll('button,input,select,textarea,a[href],[tabindex="0"]')).filter(n => !n.disabled && n.getClientRects().length);
+            if (!nodes.length) { e.preventDefault(); panel.focus(); return; }
+            const i = nodes.indexOf(document.activeElement);
+            if (e.shiftKey && i <= 0) { e.preventDefault(); nodes.at(-1).focus(); }
+            else if (!e.shiftKey && (i === nodes.length - 1 || i === -1)) { e.preventDefault(); nodes[0].focus(); }
+        });
+        document.body.appendChild(overlay); state.modal = overlay; panel.focus(); return panel;
+    }
+    function field(labelText, control) {
+        const label = el("label", null, P + "field"); label.append(el("span", labelText), control); return label;
+    }
+    function optionSelect(options, selected, onChange) {
+        const select = el("select");
+        for (const [value, name] of options) { const option = el("option", name); option.value = value; select.append(option); }
+        select.value = selected; select.addEventListener("change", () => onChange(select.value)); return select;
+    }
+    function settingCheck(container, key, label) {
+        const input = el("input"); input.type = "checkbox"; input.checked = state.opts[key];
+        input.addEventListener("change", () => { state.opts[key] = input.checked; saveOptions(); schedule(); }); container.append(field(label, input));
+    }
+    function clearReferences() { state.pins.clear(); schedule(); log("Manual references cleared"); }
+    function setReference(model) {
+        if (!model.group || (!model.uid && model.group !== "Temporary")) { state.notice = "An exact item UID is needed before using this item as reference."; schedule(); return; }
+        state.pins.set(model.group, { id: model.id, uid: model.uid }); log("Reference chosen", { group: model.group, itemId: model.id, uid: model.uid || "stack" }); schedule(); closeModal();
+    }
+    async function refresh(force = false) {
+        if (!state.key) { openSettings(); return; }
+        if (state.hydrating) { state.notice = "A refresh is already running."; schedule(); return; }
+        if (Date.now() < state.blockedUntil) { state.notice = "API cooldown ends at " + new Date(state.blockedUntil).toLocaleTimeString(); schedule(); return; }
+        state.blocked = ""; state.notice = ""; state.failures.clear(); state.equipmentFailedAt = 0; state.equipmentWanted = true;
+        const uids = new Set([...currentModels(), ...references(currentModels()).values()].map(m => m.uid));
+        for (const uid of uids) { const d = state.details.get(uid); if (d) d.at = 0; }
+        if (force) { state.catalogs.clear(); state.catalogAttempts.clear(); state.inventories.clear(); }
+        log("Manual refresh", { referenceData: force }); schedule();
+    }
+    async function setKey(key, feedback) {
+        if (!/^[A-Za-z0-9]{16}$/.test(key)) { feedback.textContent = "Enter a valid 16-character Torn API key."; return; }
+        state.epoch++; state.requestAbort.abort(); state.requestAbort = new AbortController();
+        state.key = key; state.blocked = ""; state.blockedUntil = 0; state.notice = "";
+        state.equipment = []; state.equipmentAt = 0; state.equipmentFailedAt = 0; state.equipmentWanted = true;
+        state.inventories.clear(); state.details.clear(); state.pins.clear(); state.failures.clear(); state.catalogAttempts.clear();
+        await state.writes; await removeStore("cache");
+        const saved = await writeStore("api-key", key);
+        feedback.textContent = saved ? "Key saved. Loading stats; you can close settings." : "Key active for this page. Persistent storage is unavailable.";
+        log("API key updated", { stored: saved }); schedule();
+    }
+    function openSettings() {
+        const panel = modal("Inventory Compare · " + VERSION);
+        panel.append(el("p", "Compare individual item ratings against the equipped item in each category or armor slot. Tap any row's comparison to choose another reference.", P + "muted"));
+        const credentials = el("div", null, P + "stack"); credentials.append(el("h3", "Torn API key"));
+        const key = el("input"); key.type = "password"; key.maxLength = 16; key.autocomplete = "off"; key.spellcheck = false; key.setAttribute("aria-label", "16-character Torn API key");
+        key.placeholder = state.key ? "Key saved. Enter a new key to replace it." : "16-character minimal-access key";
+        const feedback = el("p", "", P + "muted"); feedback.setAttribute("aria-live", "polite");
+        const keyActions = el("div", null, P + "actions");
+        keyActions.append(button("Save key", async function () { const value = key.value.trim(); key.value = ""; await setKey(value, feedback); }),
+            button("Forget key", async () => {
+                state.epoch++; state.requestAbort.abort(); state.requestAbort = new AbortController(); state.key = "";
+                state.equipment = []; state.details.clear(); state.inventories.clear(); state.pins.clear(); state.blocked = "";
+                await state.writes; await removeStore("api-key"); await removeStore("cache"); feedback.textContent = "Key and private cached data removed."; log("Key removed"); schedule();
+            }), link("Create a minimal-access key", "https://www.torn.com/preferences.php#tab=api"));
+        credentials.append(key, keyActions, feedback, el("small", state.fallbackStorage ? "This WebView uses session storage. Your key may need entering again after closing the session." : "The key is stored through the userscript manager and sent only to api.torn.com. It is never included in copied logs.")); panel.append(credentials);
+        const settings = el("div", null, P + "stack"); settings.append(el("h3", "Display and reference"));
+        settingCheck(settings, "enabled", "Enable comparisons"); settingCheck(settings, "showValues", "Show actual numeric ratings");
+        settingCheck(settings, "showDeltas", "Show numeric differences"); settingCheck(settings, "showRoF", "Show firearm rate of fire"); settingCheck(settings, "showEffects", "Show temporary effect symbols");
+        settings.append(field("Reference behavior", optionSelect([["equipped", "Equipped item, with optional chosen override"], ["selected", "Last tapped inventory item"]], state.opts.referenceMode, v => { state.opts.referenceMode = v; clearReferences(); saveOptions(); })),
+            field("Coverage area", optionSelect([["slot", "Slot area: head / chest / hand / leg / foot"], ...AREAS.map(a => [a, a])], state.opts.coverageArea, v => { state.opts.coverageArea = v; saveOptions(); schedule(); })));
+        const size = el("input"); size.type = "number"; size.min = "9"; size.max = "15"; size.value = state.opts.fontSize; size.style.maxWidth = "72px";
+        size.addEventListener("change", () => { state.opts.fontSize = Math.max(9, Math.min(15, number(size.value) || 11)); size.value = state.opts.fontSize; saveOptions(); applyTheme(); schedule(); }); settings.append(field("Stat text size (px)", size));
+        for (const [k, label] of [["upColor", "↑ Higher value color"], ["downColor", "↓ Lower value color"]]) {
+            const input = el("input"); input.type = "color"; input.value = state.opts[k];
+            input.addEventListener("change", () => { state.opts[k] = input.value; saveOptions(); applyTheme(); schedule(); }); settings.append(field(label, input));
+        }
+        const refreshActions = el("div", null, P + "actions"); refreshActions.append(button("Refresh visible stats", () => { void refresh(); }), button("Refresh reference data", () => { void refresh(true); }), button("Use equipped references", () => { state.opts.referenceMode = "equipped"; saveOptions(); clearReferences(); openSettings(); }));
+        settings.append(refreshActions); panel.append(settings);
+        panel.append(el("p", "D = intrinsic damage rating, not predicted HP damage. A = accuracy. AR = armor. C(area) = coverage of that body area. ↑ higher, ↓ lower, = equal, ? unavailable. RoF is the unmodified rounds-per-turn range, not attack speed; ↕ means mixed bounds. Player perks, ammo, weapon mods and combat circumstances can change outcomes.", P + "callout"));
+        panel.append(el("p", "Inventory API lists can be an hour old. Individual copies are matched only by UID. Missing UIDs are never assigned by name or row order. Expand an item's native information if its UID is unavailable, then refresh. Pins last for this page session.", P + "muted"));
+        panel.append(el("h3", "Temporary effect legend"));
+        panel.append(el("p", "🌶️ pepper spray · 😵‍💫 concussion · ⚡ flash · 😶‍🌫️ smoke · 😭 tear gas · ☣️ nerve gas · 🔥 burning · 🪢 ensnare · 💥 explosive damage · 🫥 Stygian Darkness · 💪 / 🏃 / 🛡️ / 🎯 self buffs · 🎉 decorative. Tap stats for the catalog effect description.", P + "muted"));
+        panel.append(el("h3", "Diagnostics")); const debug = el("div", null, P + "actions");
+        debug.append(button("🪲", () => { closeModal(); MyDebug.toggleView(); }), button("📋 Copy Logs to Clipboard", function () { log("Diagnostic summary", { version: VERSION, rows: state.scanned, loaded: state.loaded, rootFound: Boolean(state.root), blocked: Boolean(state.blocked) }); void MyDebug.copy(this); })); panel.append(debug);
+        panel.append(el("h3", "Support ThaWookie")); const supportHost = el("div"); supportHost.id = P + "support-host"; panel.append(supportHost);
+        state.support = createEmbeddedSupportModule(supportHost);
+        panel.append(link("Greasy Fork: ShavedW00kie", "https://greasyfork.org/en/users/1597765-shavedw00kie"));
+    }
+    function tableRow(table, values, heading = false) {
+        const row = el("tr"); for (const value of values) row.append(el(heading ? "th" : "td", value)); table.append(row);
+    }
+    function openDetails(model, ref) {
+        const item = catalogEntry(model.id); const actual = statsFor(model); const base = ref && statsFor(ref);
+        const panel = modal(model.name);
+        panel.append(el("p", (model.uid ? "UID " + model.uid : "No unique UID exposed in this row") + " · " + (model.group || "unknown slot"), P + "muted"));
+        panel.append(el("p", ref ? "Compared with " + ref.name + (ref.uid ? " [" + ref.uid + "]" : "") + " · " + ref.referenceSource : "No reference is available in this slot. Choose an inventory item below.", P + "callout"));
+        const t = el("table", null, P + "table"); tableRow(t, ["Rating", "This item", "Reference", "Change"], true);
+        for (const [key, name] of model.group === "Temporary" ? [["damage", "Damage rating"]] : item && item.type === "Armor" ? [["armor", "Armor rating"]] : [["damage", "Damage rating"], ["accuracy", "Accuracy"]]) {
+            const a = actual && actual[key], b = base && base[key]; const c = compare(a, b); tableRow(t, [name, fmt(a), fmt(b), c.symbol + (c.delta !== undefined ? " " + (c.delta > 0 ? "+" : "") + fmt(c.delta) : "")]);
+        }
+        const rate = rof(item); const baseRate = ref && rof(catalogEntry(ref.id));
+        if (rate) tableRow(t, ["RoF (rounds / turn)", rate.min + "-" + rate.max, baseRate ? baseRate.min + "-" + baseRate.max : "?", compareRoF(rate, baseRate).symbol]);
+        panel.append(t);
+        if (actual) panel.append(el("small", "Source: " + actual.source + (actual.at ? " · fetched " + new Date(actual.at).toLocaleString() : "") + (actual.stale ? " · cached, refresh pending" : "")));
+        else panel.append(el("p", model.uid ? "Individual stats are pending or unavailable. Check API status in settings and Refresh." : "Torn must expose this copy's UID before rolled stats can be shown. Expanding its native information can expose the UID. Copies are never guessed by their names or order.", P + "muted"));
+        if (model.group === "Temporary") {
+            const e = effect(item); panel.append(el("p", e.symbol + " " + e.label, P + "callout")); panel.append(el("p", e.text));
+            panel.append(el("p", "Displayed damage is the fixed item rating. It does not predict HP lost or compare the tactical value of buffs and debuffs.", P + "muted"));
+        }
+        if (item && item.type === "Armor") {
+            panel.append(el("h3", "Coverage by body area")); const ct = el("table", null, P + "table"); tableRow(ct, ["Area", "This item", "Reference", "Change"], true);
+            for (const area of AREAS) {
+                const a = coverage(item, area), b = ref ? coverage(catalogEntry(ref.id), area) : null;
+                if (a === null && b === null) continue;
+                tableRow(ct, [area, a === null ? "?" : fmt(a) + "%", b === null ? "?" : fmt(b) + "%", compare(a, b).symbol]);
+            }
+            panel.append(ct, el("p", "These are individual body-area percentages. They are not added together. Full Body is shown only when Torn explicitly supplies that aggregate.", P + "muted"));
+            panel.append(field("Armor slot override", optionSelect([["auto", "Automatic"], ...Object.keys(SLOT_AREA).map(s => [s, s])], state.opts.armorSlots[model.id] || "auto", v => {
+                if (v === "auto") delete state.opts.armorSlots[model.id]; else state.opts.armorSlots[model.id] = v;
+                saveOptions(); clearReferences(); closeModal(); schedule();
+            })));
+        }
+        if (actual && actual.bonuses && actual.bonuses.length) {
+            panel.append(el("h3", "Reported bonuses"));
+            for (const bonus of actual.bonuses) panel.append(el("p", clean(bonus.title || bonus.name) + (number(bonus.value) !== null ? ": " + bonus.value : "") + (bonus.description ? " · " + clean(bonus.description) : ""), P + "muted"));
+        }
+        const actions = el("div", null, P + "actions");
+        const choose = button("Compare against this item", () => setReference(model)); choose.disabled = !model.group || (!model.uid && model.group !== "Temporary");
+        actions.append(choose, button("Use equipped references", () => { state.opts.referenceMode = "equipped"; saveOptions(); clearReferences(); closeModal(); }), button("Settings", openSettings)); panel.append(actions);
+    }
+
+    function nativeClick(event) {
+        if (owned(event.target) || !(event.target instanceof Element) || !state.root || !state.root.contains(event.target)) return;
+        const row = event.target.closest(ROWS);
+        if (row && state.opts.referenceMode === "selected" && !event.target.closest('a,button,input,select,label,[role="button"],.option,.option-wrap')) {
+            const model = readRow(row); if (model && model.group && (model.uid || model.group === "Temporary")) { state.pins.set(model.group, { id: model.id, uid: model.uid }); schedule(); }
+        }
+        const action = event.target.closest('.option-equip,.option-unequip,[data-action="equip"],[data-action="unequip"]');
+        if (action) { state.equipmentWanted = true; state.equipmentFailedAt = 0; state.pins.clear(); schedule(); }
+    }
+    async function boot() {
+        const [opts, key, cached] = await Promise.all([readStore("options", {}), readStore("api-key", ""), readStore("cache", null)]);
+        state.opts = sanitizeOptions(opts); state.key = typeof key === "string" && /^[A-Za-z0-9]{16}$/.test(key) ? key : "";
+        if (cached && cached.schema === 1) {
+            for (const pair of Array.isArray(cached.catalogs) ? cached.catalogs : []) if (Array.isArray(pair) && pair[1] && Array.isArray(pair[1].items)) state.catalogs.set(pair[0], pair[1]);
+            for (const pair of Array.isArray(cached.details) ? cached.details : []) if (Array.isArray(pair) && pair[1] && uidOf(pair[1].uid)) state.details.set(pair[0], pair[1]);
+            for (const pair of Array.isArray(cached.inventories) ? cached.inventories : []) if (Array.isArray(pair) && pair[1] && Array.isArray(pair[1].items)) state.inventories.set(pair[0], pair[1]);
+        }
+        styles();
+        document.addEventListener("click", nativeClick, true);
+        state.discovery = new MutationObserver(records => {
+            if (!state.root || !state.root.isConnected || !state.toolbar || !state.toolbar.isConnected) { schedule(); return; }
+            if (records.some(m => !owned(m.target) && [...m.addedNodes, ...m.removedNodes].some(n => n.nodeType === 1 && !owned(n) && (n.matches(".items-wrap,#all-items") || n.querySelector(".items-wrap,#all-items"))))) schedule();
+        });
+        state.discovery.observe(document.documentElement, { childList: true, subtree: true });
+        window.addEventListener("pageshow", schedule);
+        window.addEventListener("hashchange", schedule);
+        window.addEventListener("focus", () => { if (Date.now() - state.equipmentAt > 120000) state.equipmentWanted = true; schedule(); });
+        document.addEventListener("visibilitychange", () => { if (!document.hidden) { if (Date.now() - state.equipmentAt > 120000) state.equipmentWanted = true; schedule(); } });
+        try {
+            const register = typeof GM_registerMenuCommand === "function" ? GM_registerMenuCommand : typeof GM !== "undefined" && GM.registerMenuCommand ? GM.registerMenuCommand.bind(GM) : null;
+            if (register) register("Inventory Compare settings", openSettings);
+        } catch (_) { log("Userscript menu unavailable", {}, "DEBUG"); }
+        log("Started", { version: VERSION, cachedItems: state.details.size, keyPresent: Boolean(state.key) }); schedule();
+    }
+
+    // Supplied SupportModule and debugger are bundled below, inside this IIFE.
+
+/*
+// @grant        GM_addStyle
+// @run-at       document-end
+// ==/UserScript==
+
+/*
+ * Donation UI Module
+ * Version 1.4
+ *
+ * Reusable support/donation UI for Torn.com userscripts.
+ *
+ * Features:
+ *   - Animated Buy Me a Coffee button
+ *   - Animated coffee cup with squash-and-stretch movement
+ *   - Animated steam
+ *   - Animated coffee fill
+ *   - Hover-to-fill coffee effect
+ *   - Periodic diagonal button gleam
+ *   - Animated liquid-style label transition
+ *   - Torn Xanax-tip button
+ *   - MutationObserver persistence against Torn/React DOM changes
+ *   - TornPDA/mobile-compatible DOM implementation
+ *   - Reduced-motion accessibility support
+ *
+ * License: BSD-3-Clause
+ *
+ * Copyright (c) 2026 ShavedW00kie
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+    function createEmbeddedSupportModule(host) {
+    const DEFAULT_CONFIG = Object.freeze({
+        bmcId: "bittick1c",
+        tornUserId: "2954173",
+
+        containerId: "thawookie-support-module",
+        styleId: "thawookie-support-module-style"
+    });
+
+    /*
+     * Unique counter used for SVG clipPath IDs.
+     *
+     * SVG IDs are document-global. If multiple instances of this
+     * module are ever created, sharing a clipPath ID can cause one
+     * SVG to reference another SVG's clipping path.
+     */
+    let coffeeInstanceCount = 0;
+
+    /* ============================================================
+     * SUPPORT MODULE
+     * ============================================================ */
+
+    class SupportModule {
+        constructor(config = {}) {
+            this.config = {
+                ...DEFAULT_CONFIG,
+                ...config
+            };
+
+            this.observer = null;
+            this.observerAttached = false;
+            this.isInjecting = false;
+            this.destroyed = false;
+
+            this.init();
+        }
+
+        /* ========================================================
+         * INITIALIZATION
+         * ======================================================== */
+
+        init() {
+            if (this.destroyed) {
+                return;
+            }
+
+            if (!this.getBody()) {
+                if (document.readyState === "loading") {
+                    document.addEventListener(
+                        "DOMContentLoaded",
+                        () => this.init(),
+                        { once: true }
+                    );
+                }
+
+                return;
+            }
+
+            this.injectStyles();
+            this.injectUI();
+            this.attachObserver();
+        }
+
+        /* ========================================================
+         * DOM HELPERS
+         * ======================================================== */
+
+        getBody() {
+            return host && host.isConnected ? host : null;
+        }
+
+        getContainer() {
+            return document.getElementById(
+                this.config.containerId
+            );
+        }
+
+        isContainerConnected() {
+            const container = this.getContainer();
+
+            return Boolean(
+                container &&
+                container.isConnected
+            );
+        }
+
+        /* ========================================================
+         * STYLE INJECTION
+         * ======================================================== */
+
+        injectStyles() {
+            if (this.destroyed) {
+                return;
+            }
+
+            if (document.getElementById(this.config.styleId)) {
+                return;
+            }
+
+            const styles = `
+                /* =================================================
+                 * DONATION CONTAINER
+                 * ================================================= */
+
+                #${this.config.containerId} {
+                    position: fixed;
+                    bottom: 20px;
+                    right: 20px;
+                    z-index: 2147483640;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 10px;
+                    font-family: Arial, sans-serif;
+                    box-sizing: border-box;
+                    touch-action: manipulation;
+                }
+
+                /* =================================================
+                 * GENERIC SUPPORT BUTTON
+                 * ================================================= */
+
+                #${this.config.containerId} .tw-support-btn {
+                    box-sizing: border-box;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    min-height: 40px;
+                    padding: 10px 15px;
+                    border-radius: 8px;
+                    font-size: 13px;
+                    font-weight: bold;
+                    line-height: 1.2;
+                    text-align: center;
+                    text-decoration: none !important;
+                    cursor: pointer;
+                    user-select: none;
+                    -webkit-tap-highlight-color: transparent;
+                    touch-action: manipulation;
+                }
+
+                #${this.config.containerId} .tw-support-btn:focus-visible {
+                    outline: 2px solid #ffffff;
+                    outline-offset: 2px;
+                }
+
+                /* =================================================
+                 * BUY ME A COFFEE BUTTON
+                 *
+                 * Visual design ported from the supplied animated
+                 * coffee-button implementation:
+                 *
+                 *   #FFDD00 yellow
+                 *   black foreground
+                 *   6px radius
+                 *   6px 12px compact padding
+                 *   11px / 600 typography
+                 *   animated glare
+                 *   animated cup
+                 * ================================================= */
+
+                #${this.config.containerId} .tw-bmc {
+                    position: relative;
+                    overflow: hidden;
+                    isolation: isolate;
+
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 6px;
+
+                    width: 100%;
+                    min-width: 170px;
+                    min-height: 40px;
+
+                    padding: 6px 12px;
+
+                    background: #FFDD00;
+                    color: #000000 !important;
+
+                    border: 1px solid #FFDD00;
+                    border-radius: 6px;
+
+                    font-size: 11px;
+                    font-weight: 600;
+                    line-height: 1.2;
+
+                    text-decoration: none !important;
+
+                    box-sizing: border-box;
+
+                    transition:
+                        opacity 0.15s ease,
+                        transform 0.15s ease;
+                }
+
+                /*
+                 * Keep all actual button contents above the
+                 * animated specular highlight.
+                 */
+                #${this.config.containerId} .tw-bmc > * {
+                    position: relative;
+                    z-index: 1;
+                }
+
+                /*
+                 * Subtle interaction feedback.
+                 *
+                 * Hover is deliberately opacity-based rather than
+                 * relying on desktop-only behavior for functionality.
+                 * The button remains fully usable through touch.
+                 */
+                #${this.config.containerId} .tw-bmc:hover {
+                    opacity: 0.9;
+                }
+
+                #${this.config.containerId} .tw-bmc:active {
+                    transform: scale(0.97);
+                }
+
+                /* =================================================
+                 * COFFEE CUP - SQUASH & STRETCH
+                 * ================================================= */
+
+                @keyframes tw-coffee-cup-hop {
+                    0% {
+                        transform:
+                            translateY(0)
+                            scale(1, 1);
+                    }
+
+                    18% {
+                        transform:
+                            translateY(0.5px)
+                            scale(1.08, 0.9);
+                    }
+
+                    32% {
+                        transform:
+                            translateY(-2px)
+                            scale(0.94, 1.08);
+                    }
+
+                    50% {
+                        transform:
+                            translateY(-3px)
+                            scale(1, 1);
+                    }
+
+                    68% {
+                        transform:
+                            translateY(0)
+                            scale(1.1, 0.88);
+                    }
+
+                    84% {
+                        transform:
+                            translateY(0)
+                            scale(0.97, 1.03);
+                    }
+
+                    100% {
+                        transform:
+                            translateY(0)
+                            scale(1, 1);
+                    }
+                }
+
+                #${this.config.containerId} .tw-coffee-cup {
+                    position: relative;
+                    display: inline-flex;
+                    flex-shrink: 0;
+
+                    transform-origin: 50% 100%;
+
+                    animation:
+                        tw-coffee-cup-hop
+                        2.4s
+                        cubic-bezier(0.4, 0, 0.5, 1)
+                        infinite;
+                }
+
+                /*
+                 * Cup outline remains above the steam.
+                 */
+                #${this.config.containerId} .tw-coffee-cup > svg {
+                    position: relative;
+                    z-index: 1;
+                    display: block;
+                }
+
+                /* =================================================
+                 * STEAM
+                 * ================================================= */
+
+                #${this.config.containerId} .tw-coffee-cup::before,
+                #${this.config.containerId} .tw-coffee-cup::after {
+                    content: "";
+
+                    position: absolute;
+
+                    bottom: 74%;
+
+                    width: 2px;
+                    height: 4px;
+
+                    border-radius: 999px;
+
+                    background:
+                        linear-gradient(
+                            to top,
+                            rgba(90, 58, 36, 0.5),
+                            rgba(90, 58, 36, 0)
+                        );
+
+                    opacity: 0;
+
+                    pointer-events: none;
+
+                    will-change:
+                        transform,
+                        opacity;
+                }
+
+                #${this.config.containerId} .tw-coffee-cup::before {
+                    left: 27%;
+
+                    animation:
+                        tw-coffee-steam
+                        2.8s
+                        ease-out
+                        infinite;
+                }
+
+                #${this.config.containerId} .tw-coffee-cup::after {
+                    left: 45%;
+
+                    animation:
+                        tw-coffee-steam
+                        2.8s
+                        ease-out
+                        infinite;
+
+                    animation-delay: -1.4s;
+                }
+
+                @keyframes tw-coffee-steam {
+                    0% {
+                        opacity: 0;
+
+                        transform:
+                            translateY(2px)
+                            scale(0.6, 0.5)
+                            skewX(0deg);
+                    }
+
+                    30% {
+                        opacity: 0.7;
+
+                        transform:
+                            translateY(0)
+                            scale(1, 0.9)
+                            skewX(4deg);
+                    }
+
+                    65% {
+                        opacity: 0.4;
+
+                        transform:
+                            translateY(-3px)
+                            scale(0.85, 1.2)
+                            skewX(-5deg);
+                    }
+
+                    100% {
+                        opacity: 0;
+
+                        transform:
+                            translateY(-5px)
+                            scale(0.5, 1.5)
+                            skewX(6deg);
+                    }
+                }
+
+                /* =================================================
+                 * COFFEE FILL
+                 * ================================================= */
+
+                #${this.config.containerId} .tw-coffee-fill {
+                    transform: scaleY(0.15);
+                    transform-origin: 50% 100%;
+
+                    animation:
+                        tw-coffee-refill
+                        7s
+                        cubic-bezier(0.45, 0, 0.55, 1)
+                        infinite;
+                }
+
+                @keyframes tw-coffee-refill {
+                    0% {
+                        transform: scaleY(0.15);
+                    }
+
+                    30% {
+                        transform: scaleY(0.95);
+                    }
+
+                    55% {
+                        transform: scaleY(0.75);
+                    }
+
+                    80% {
+                        transform: scaleY(0.3);
+                    }
+
+                    100% {
+                        transform: scaleY(0.15);
+                    }
+                }
+
+                /*
+                 * Hover overrides the normal coffee cycle and fills
+                 * the cup completely.
+                 */
+                #${this.config.containerId}
+                .tw-bmc:hover
+                .tw-coffee-fill {
+                    animation:
+                        tw-coffee-fill-to-full
+                        0.45s
+                        cubic-bezier(0.4, 0, 0.2, 1)
+                        forwards;
+                }
+
+                @keyframes tw-coffee-fill-to-full {
+                    to {
+                        transform: scaleY(1);
+                    }
+                }
+
+                /* =================================================
+                 * SPECULAR GLEAM
+                 * ================================================= */
+
+                /*
+                 * A soft diagonal highlight sweeps across the
+                 * yellow button every five seconds.
+                 */
+                #${this.config.containerId} .tw-bmc::after {
+                    content: "";
+
+                    position: absolute;
+
+                    top: 0;
+                    bottom: 0;
+                    left: -60%;
+
+                    width: 45%;
+
+                    pointer-events: none;
+
+                    background:
+                        linear-gradient(
+                            100deg,
+                            transparent 0%,
+                            rgba(255, 255, 255, 0.15) 35%,
+                            rgba(255, 255, 255, 0.75) 50%,
+                            rgba(255, 255, 255, 0.15) 65%,
+                            transparent 100%
+                        );
+
+                    transform: skewX(-18deg);
+
+                    will-change: transform;
+
+                    animation:
+                        tw-coffee-glare
+                        5s
+                        cubic-bezier(0.5, 0, 0.5, 1)
+                        infinite;
+                }
+
+                @keyframes tw-coffee-glare {
+                    0% {
+                        transform:
+                            translateX(0)
+                            skewX(-18deg);
+                    }
+
+                    22%,
+                    100% {
+                        transform:
+                            translateX(400%)
+                            skewX(-18deg);
+                    }
+                }
+
+                /* =================================================
+                 * LIQUID LABEL TRANSITION
+                 * ================================================= */
+
+                #${this.config.containerId} .tw-coffee-label {
+                    display: grid;
+                    align-items: center;
+                    justify-items: center;
+
+                    min-width: 0;
+                }
+
+                #${this.config.containerId} .tw-coffee-label > span {
+                    grid-area: 1 / 1;
+
+                    white-space: nowrap;
+
+                    transform-origin: 50% 50%;
+
+                    will-change:
+                        opacity,
+                        transform,
+                        filter;
+
+                    animation:
+                        tw-coffee-label-drip
+                        7s
+                        cubic-bezier(0.65, 0, 0.35, 1)
+                        infinite;
+                }
+
+                /*
+                 * The second label is exactly 50% out of phase,
+                 * creating the alternating liquid transition.
+                 */
+                #${this.config.containerId}
+                .tw-coffee-label
+                > span:nth-child(2) {
+                    animation-delay: -3.5s;
+                }
+
+                @keyframes tw-coffee-label-drip {
+                    0%,
+                    34% {
+                        opacity: 1;
+
+                        transform:
+                            translateY(0)
+                            scale(1, 1);
+
+                        filter: blur(0);
+                    }
+
+                    38% {
+                        opacity: 0.5;
+
+                        transform:
+                            translateY(2px)
+                            scale(0.94, 1.08);
+
+                        filter: blur(1.2px);
+                    }
+
+                    42% {
+                        opacity: 0;
+
+                        transform:
+                            translateY(9px)
+                            scale(1.06, 0.5);
+
+                        filter: blur(4px);
+                    }
+
+                    42.01%,
+                    92% {
+                        opacity: 0;
+
+                        transform:
+                            translateY(-9px)
+                            scale(1.06, 0.5);
+
+                        filter: blur(4px);
+                    }
+
+                    96% {
+                        opacity: 1;
+
+                        transform:
+                            translateY(1px)
+                            scale(1.05, 0.9);
+
+                        filter: blur(0);
+                    }
+
+                    98% {
+                        opacity: 1;
+
+                        transform:
+                            translateY(0)
+                            scale(0.99, 1.03);
+
+                        filter: blur(0);
+                    }
+
+                    100% {
+                        opacity: 1;
+
+                        transform:
+                            translateY(0)
+                            scale(1, 1);
+
+                        filter: blur(0);
+                    }
+                }
+
+                /* =================================================
+                 * TORN TIP BUTTON
+                 * ================================================= */
+
+                #${this.config.containerId} .tw-torn-tip {
+                    background-color: #8ab63d;
+                    color: #ffffff !important;
+
+                    border: 1px solid #6a8c2f;
+
+                    box-shadow:
+                        0 4px 6px rgba(0, 0, 0, 0.3);
+
+                    transition:
+                        transform 0.2s ease,
+                        background-color 0.2s ease;
+                }
+
+                #${this.config.containerId} .tw-torn-tip:active {
+                    transform: scale(0.95);
+                }
+
+                /* =================================================
+                 * REDUCED MOTION
+                 * ================================================= */
+
+                @media (prefers-reduced-motion: reduce) {
+                    #${this.config.containerId}
+                    .tw-coffee-cup {
+                        animation: none;
+                    }
+
+                    #${this.config.containerId}
+                    .tw-coffee-cup::before,
+                    #${this.config.containerId}
+                    .tw-coffee-cup::after {
+                        animation: none;
+                        opacity: 0;
+                    }
+
+                    #${this.config.containerId}
+                    .tw-coffee-fill {
+                        animation: none;
+                        transform: scaleY(0.8);
+                    }
+
+                    #${this.config.containerId}
+                    .tw-coffee-label > span {
+                        animation: none;
+                        opacity: 0;
+                        filter: none;
+                        transform: none;
+                    }
+
+                    #${this.config.containerId}
+                    .tw-coffee-label
+                    > span:nth-child(2) {
+                        opacity: 1;
+                    }
+
+                    #${this.config.containerId}
+                    .tw-bmc::after {
+                        animation: none;
+                        opacity: 0;
+                    }
+                }
+
+                /* =================================================
+                 * MOBILE / TORN PDA
+                 * ================================================= */
+
+                @media (max-width: 480px) {
+                    #${this.config.containerId} {
+                        right: 10px;
+                        bottom: 10px;
+                        left: 10px;
+
+                        width: auto;
+                    }
+
+                    #${this.config.containerId}
+                    .tw-support-btn {
+                        width: 100%;
+                    }
+
+                    #${this.config.containerId}
+                    .tw-bmc {
+                        min-width: 0;
+                    }
+                }
+            `;
+
+            /*
+             * Preferred Tampermonkey path.
+             *
+             * Some restricted WebViews can expose GM_addStyle but
+             * still throw when it is called. Fall back safely.
+             */
+            this.injectStyleElement(styles);
+        }
+
+        injectStyleElement(styles) {
+            if (document.getElementById(this.config.styleId)) {
+                return;
+            }
+
+            const styleNode =
+                document.createElement("style");
+
+            styleNode.id =
+                this.config.styleId;
+
+            styleNode.type =
+                "text/css";
+
+            styleNode.textContent =
+                styles;
+
+            if (document.head) {
+                document.head.appendChild(styleNode);
+                return;
+            }
+
+            const body = this.getBody();
+
+            if (body) {
+                body.appendChild(styleNode);
+            }
+        }
+
+        /* ========================================================
+         * COFFEE BUTTON
+         * ======================================================== */
+
+        buildCoffeeButton() {
+            coffeeInstanceCount += 1;
+
+            const clipId =
+                `${this.config.containerId}-coffee-clip-${coffeeInstanceCount}`;
+
+            const bmcLink =
+                document.createElement("a");
+
+            bmcLink.className =
+                "tw-support-btn tw-bmc";
+
+            bmcLink.href =
+                `https://www.buymeacoffee.com/${encodeURIComponent(
+                    this.config.bmcId
+                )}`;
+
+            bmcLink.target = "_blank";
+
+            bmcLink.rel =
+                "noopener noreferrer";
+
+            bmcLink.title =
+                "Support ThaWookie";
+
+            bmcLink.setAttribute(
+                "aria-label",
+                "Buy me a coffee - support ThaWookie"
+            );
+
+            /*
+             * ----------------------------------------------------
+             * Animated coffee cup
+             * ----------------------------------------------------
+             */
+
+            const cup =
+                document.createElement("span");
+
+            cup.className =
+                "tw-coffee-cup";
+
+            cup.setAttribute(
+                "aria-hidden",
+                "true"
+            );
+
+            const svg =
+                document.createElementNS(
+                    "http://www.w3.org/2000/svg",
+                    "svg"
+                );
+
+            svg.setAttribute(
+                "width",
+                "16"
+            );
+
+            svg.setAttribute(
+                "height",
+                "16"
+            );
+
+            svg.setAttribute(
+                "viewBox",
+                "0 0 24 24"
+            );
+
+            svg.setAttribute(
+                "fill",
+                "none"
+            );
+
+            svg.setAttribute(
+                "stroke",
+                "currentColor"
+            );
+
+            svg.setAttribute(
+                "stroke-width",
+                "1.5"
+            );
+
+            svg.setAttribute(
+                "aria-hidden",
+                "true"
+            );
+
+            /*
+             * SVG clip path.
+             *
+             * This is intentionally generated through DOM APIs
+             * rather than innerHTML so the only dynamic value,
+             * clipId, cannot become an HTML injection vector.
+             */
+
+            const defs =
+                document.createElementNS(
+                    "http://www.w3.org/2000/svg",
+                    "defs"
+                );
+
+            const clipPath =
+                document.createElementNS(
+                    "http://www.w3.org/2000/svg",
+                    "clipPath"
+                );
+
+            clipPath.setAttribute(
+                "id",
+                clipId
+            );
+
+            const clipShape =
+                document.createElementNS(
+                    "http://www.w3.org/2000/svg",
+                    "path"
+                );
+
+            clipShape.setAttribute(
+                "d",
+                "M5 8h11v5a4 4 0 0 1-4 4H9a4 4 0 0 1-4-4V8z"
+            );
+
+            clipPath.appendChild(
+                clipShape
+            );
+
+            defs.appendChild(
+                clipPath
+            );
+
+            svg.appendChild(
+                defs
+            );
+
+            /*
+             * Coffee liquid.
+             *
+             * The CSS transform animation controls its visible
+             * fill level.
+             */
+            const coffeeFill =
+                document.createElementNS(
+                    "http://www.w3.org/2000/svg",
+                    "rect"
+                );
+
+            coffeeFill.setAttribute(
+                "class",
+                "tw-coffee-fill"
+            );
+
+            coffeeFill.setAttribute(
+                "x",
+                "5"
+            );
+
+            coffeeFill.setAttribute(
+                "y",
+                "8"
+            );
+
+            coffeeFill.setAttribute(
+                "width",
+                "11"
+            );
+
+            coffeeFill.setAttribute(
+                "height",
+                "9"
+            );
+
+            coffeeFill.setAttribute(
+                "fill",
+                "#6f4e37"
+            );
+
+            coffeeFill.setAttribute(
+                "stroke",
+                "none"
+            );
+
+            coffeeFill.setAttribute(
+                "clip-path",
+                `url(#${clipId})`
+            );
+
+            svg.appendChild(
+                coffeeFill
+            );
+
+            /*
+             * Cup body outline.
+             */
+            const cupBody =
+                document.createElementNS(
+                    "http://www.w3.org/2000/svg",
+                    "path"
+                );
+
+            cupBody.setAttribute(
+                "stroke-linecap",
+                "round"
+            );
+
+            cupBody.setAttribute(
+                "stroke-linejoin",
+                "round"
+            );
+
+            cupBody.setAttribute(
+                "d",
+                "M5 8h11v5a4 4 0 0 1-4 4H9a4 4 0 0 1-4-4V8z"
+            );
+
+            svg.appendChild(
+                cupBody
+            );
+
+            /*
+             * Cup handle.
+             */
+            const cupHandle =
+                document.createElementNS(
+                    "http://www.w3.org/2000/svg",
+                    "path"
+                );
+
+            cupHandle.setAttribute(
+                "stroke-linecap",
+                "round"
+            );
+
+            cupHandle.setAttribute(
+                "stroke-linejoin",
+                "round"
+            );
+
+            cupHandle.setAttribute(
+                "d",
+                "M16 9h2.5a2.5 2.5 0 0 1 0 5H16"
+            );
+
+            svg.appendChild(
+                cupHandle
+            );
+
+            cup.appendChild(
+                svg
+            );
+
+            bmcLink.appendChild(
+                cup
+            );
+
+            /*
+             * ----------------------------------------------------
+             * Animated label
+             * ----------------------------------------------------
+             */
+
+            const label =
+                document.createElement("span");
+
+            label.className =
+                "tw-coffee-label";
+
+            label.setAttribute(
+                "aria-hidden",
+                "true"
+            );
+
+            const supportLabel =
+                document.createElement("span");
+
+            supportLabel.textContent =
+                "Support the project?";
+
+            const coffeeLabel =
+                document.createElement("span");
+
+            coffeeLabel.textContent =
+                "Buy me a coffee";
+
+            label.appendChild(
+                supportLabel
+            );
+
+            label.appendChild(
+                coffeeLabel
+            );
+
+            bmcLink.appendChild(
+                label
+            );
+
+            return bmcLink;
+        }
+
+        /* ========================================================
+         * UI INJECTION
+         * ======================================================== */
+
+        injectUI() {
+            if (
+                this.destroyed ||
+                this.isInjecting
+            ) {
+                return;
+            }
+
+            const body =
+                this.getBody();
+
+            if (!body) {
+                return;
+            }
+
+            if (this.isContainerConnected()) {
+                return;
+            }
+
+            this.isInjecting = true;
+
+            try {
+                /*
+                 * Remove stale disconnected node, if present.
+                 */
+                const existingContainer =
+                    this.getContainer();
+
+                if (existingContainer) {
+                    existingContainer.remove();
+                }
+
+                const container =
+                    document.createElement("div");
+
+                container.id =
+                    this.config.containerId;
+
+                container.setAttribute(
+                    "role",
+                    "complementary"
+                );
+
+                container.setAttribute(
+                    "aria-label",
+                    "Support ThaWookie"
+                );
+
+                /*
+                 * Animated Buy Me a Coffee button.
+                 */
+                const bmcLink =
+                    this.buildCoffeeButton();
+
+                /*
+                 * ------------------------------------------------
+                 * Torn Xanax Tip
+                 * ------------------------------------------------
+                 */
+
+                const tipLink =
+                    document.createElement("a");
+
+                tipLink.href =
+                    "https://www.torn.com/item.php";
+
+                tipLink.target =
+                    "_blank";
+
+                tipLink.rel =
+                    "noopener noreferrer";
+
+                tipLink.className =
+                    "tw-support-btn tw-torn-tip";
+
+                tipLink.title =
+                    `Opens Items - search "Xanax", ` +
+                    `tap Send, enter ThaWookie ` +
+                    `[${this.config.tornUserId}]`;
+
+                tipLink.setAttribute(
+                    "aria-label",
+                    `Send a Xanax tip to ThaWookie ` +
+                    `[${this.config.tornUserId}]`
+                );
+
+                tipLink.textContent =
+                    "💊 Send a Xanax Tip";
+
+                /*
+                 * Assemble donation controls.
+                 */
+                container.appendChild(
+                    bmcLink
+                );
+
+                container.appendChild(
+                    tipLink
+                );
+
+                /*
+                 * Append directly to body so React does not own
+                 * the donation UI's DOM subtree.
+                 */
+                body.appendChild(
+                    container
+                );
+            } finally {
+                this.isInjecting = false;
+            }
+        }
+
+        /* ========================================================
+         * MUTATION OBSERVER
+         * ======================================================== */
+
+        attachObserver() {
+            if (
+                this.destroyed ||
+                this.observerAttached ||
+                typeof MutationObserver === "undefined"
+            ) {
+                return;
+            }
+
+            const body =
+                this.getBody();
+
+            if (!body) {
+                return;
+            }
+
+            this.observer =
+                new MutationObserver(
+                    (mutationList) => {
+                        if (
+                            this.destroyed ||
+                            this.isInjecting
+                        ) {
+                            return;
+                        }
+
+                        let relevantMutation =
+                            false;
+
+                        for (
+                            const mutation
+                            of mutationList
+                        ) {
+                            if (
+                                mutation.type !==
+                                "childList"
+                            ) {
+                                continue;
+                            }
+
+                            if (
+                                mutation.removedNodes
+                                    .length > 0
+                            ) {
+                                relevantMutation =
+                                    true;
+
+                                break;
+                            }
+                        }
+
+                        if (
+                            !relevantMutation
+                        ) {
+                            return;
+                        }
+
+                        if (
+                            !this.isContainerConnected()
+                        ) {
+                            this.injectStyles();
+                            this.injectUI();
+                        }
+                    }
+                );
+
+            this.observer.observe(
+                body,
+                {
+                    childList: true,
+                    subtree: true
+                }
+            );
+
+            this.observerAttached = true;
+        }
+
+        /* ========================================================
+         * CLEANUP
+         * ======================================================== */
+
+        destroy() {
+            this.destroyed = true;
+
+            if (this.observer) {
+                try {
+                    this.observer.disconnect();
+                } catch (_) {
+                    /*
+                     * Nothing further required.
+                     */
+                }
+            }
+
+            this.observer = null;
+            this.observerAttached = false;
+
+            const container =
+                this.getContainer();
+
+            if (container) {
+                container.remove();
+            }
+        }
+    }
+
+
+        return new SupportModule({ containerId: P + "support", styleId: P + "support-style" });
+    }
+
+// BEGIN SUPPLIED DEBUGGER MODULE v1.0.4
+/**
+ * File: userscript-debugger-module.js
+ * Version: 1.0.4
+ * Advanced Modular Userscript Debugger with optional DOM Inspector
+ * Author: ShavedW00kie (Torn: ThaWookie [2954173] )
+ * Namespace: https://github.com/ShavedW00kie/
+ * Target: Embedded inside a Torn.com userscript IIFE (desktop and TornPDA).
+ * License: BSD-3-Clause
+ *
+ * Copyright (c) 2026 ShavedW00kie
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ * Integration inside the host userscript's IIFE, AFTER this function definition:
+ *   const MyDebug = initializeModularDebugger(GM_info.script.name);
+ *   MyDebug.log("Ready");
+ *   bugButton.addEventListener("click", () => MyDebug.toggleView());
+ *   copyButton.addEventListener("click", function () { void MyDebug.copy(this); });
+ *   // Optional: MyDebug.inspect(), MyDebug.inspectElement(element),
+ *   // MyDebug.watchElement(element), MyDebug.stopInspection(), MyDebug.destroy().
+ *
+ * This file is a source module, not an independently installable userscript.
+ * The host userscript supplies its own ==UserScript== metadata and IIFE.
+ */
+function initializeModularDebugger(scriptNamespace) {
+    "use strict";
+    if (scriptNamespace === undefined) scriptNamespace = "App";
+
+    const randomId = (() => {
+        try {
+            if (typeof crypto !== "undefined" && crypto.randomUUID) {
+                return crypto.randomUUID().replace(/-/g, "");
+            }
+        } catch (_) { /* WebView fallback. */ }
+        return Math.random().toString(36).slice(2) + Date.now().toString(36);
+    })();
+    const id = `tw-debug-${randomId}`;
+    const LIMITS = Object.freeze({
+        buffer: (10 * 1024 * 1024) - (900 * 1024),
+        entry: 64 * 1024,
+        renderEntries: 180,
+        renderChars: 128 * 1024,
+        report: 15000,
+        html: 6000,
+        parents: 6,
+        children: 12,
+        nodes: 65,
+        mutations: 40
+    });
+    const state = {
+        logs: [], head: 0, length: 0, destroyed: false, 
+        frames: new Set(), statuses: new Map(), resizeObserver: null,
+        root: null, logArea: null, inspector: null, inspectorText: null,
+        style: null, statusBar: null, highlight: null,
+        panelMode: "logs", selected: null, picking: false,
+        watching: false, changeLog: [],
+        observer: null, parentObserver: null, uiObserver: null,
+        observedBody: null, renderPending: false,
+        pendingMutations: 0, mutationLogPending: false,
+        viewportListeners: false, highlightPending: false
+    };
+    const SENSITIVE = /(?:^key$|api[_-]?key|apikey|token|auth|authorization|cookie|secret|passwd|password|csrf|session|bearer|credential|client[_-]?secret|refresh[_-]?token|access[_-]?token)/i;
+    const SAFE_ATTRIBUTES = new Set([
+        "id", "class", "role", "type", "aria-expanded",
+        "aria-hidden", "data-testid", "data-test", "data-role", "data-state"
+    ]);
+
+    /* ---------- Redacted, bounded logging ---------- */
+    function redact(value) {
+        return String(value)
+            .replace(/\b(?:Authorization|Proxy-Authorization)\s*:\s*[^\r\n]+/gi, "Authorization: [REDACTED]")
+            .replace(/\b[A-Za-z0-9]{16}\b/g, "[POSSIBLE KEY REDACTED]")
+            // Bearer tokens and known secret-bearing URL parameters.
+            .replace(/(\bBearer\s+)[A-Za-z0-9._~+/-]+/gi, "$1[REDACTED]")
+            .replace(/([?&](?:key|api_key|token|access_token|refresh_token|secret|session|csrf)=)[^&#\s\"'<>}\]]+/gi, "$1[REDACTED]")
+            // Quoted property values, including embedded spaces.
+            .replace(/(["']?(?:api[_-]?key|apikey|token|authorization|cookie|password|passwd|secret|csrf|session|access[_-]?token|refresh[_-]?token)["']?\s*[:=]\s*)(["'])([^"']*)\2/gi,
+                (_, prefix, quote) => `${prefix}${quote}[REDACTED]${quote}`)
+            // Unquoted key=value patterns.
+            .replace(/(["']?(?:api[_-]?key|apikey|token|authorization|cookie|password|passwd|secret|csrf|session|access[_-]?token|refresh[_-]?token)["']?\s*[:=]\s*)(?!["'])([^\s"',;}&\]]+)/gi,
+                (_, prefix) => `${prefix}[REDACTED]`);
+    }
+
+    // Does not call getters or toJSON. Proxies can still execute traps; never
+    // deliberately pass hostile proxies to an in-process diagnostic function.
+    function safeSerialize(value) {
+        let remaining = 240;
+        const path = new WeakSet();
+        function visit(item, depth) {
+            if (--remaining < 0) return "[Traversal limit]";
+            if (typeof item === "string") return redact(item.slice(0, 8192));
+            if (item === null || typeof item === "boolean" || typeof item === "number") return item;
+            if (typeof item === "undefined") return "[undefined]";
+            if (typeof item === "bigint" || typeof item === "symbol") return String(item);
+            if (typeof item === "function") return "[Function]";
+            if (path.has(item)) return "[Circular]";
+            if (depth >= 5) return "[Depth limit]";
+            path.add(item);
+            try {
+                const result = Object.create(null);
+                let count = 0;
+                if (item instanceof Error) {
+                    for (const key of ["name", "message", "stack"]) {
+                        const descriptor = Object.getOwnPropertyDescriptor(item, key);
+                        result[key] = descriptor && "value" in descriptor
+                            ? visit(descriptor.value, depth + 1) : "[Unavailable/accessor]";
+                    }
+                }
+                // for-in permits early exit without allocating Object.keys for
+                // every property. Reflection itself is not a hard time limit.
+                for (const key in item) {
+                    if (!Object.prototype.hasOwnProperty.call(item, key)) continue;
+                    if (++count > 40 || remaining <= 0) { result["[Truncated]"] = true; break; }
+                    const descriptor = Object.getOwnPropertyDescriptor(item, key);
+                    result[redact(key.slice(0, 160))] = SENSITIVE.test(key) ? "[REDACTED]"
+                        : descriptor && "value" in descriptor ? visit(descriptor.value, depth + 1) : "[Accessor omitted]";
+                }
+                return result;
+            } catch (_) { return "[Unserializable]"; }
+            finally { path.delete(item); }
+        }
+        try {
+            if (typeof value === "string") return redact(value.slice(0, LIMITS.entry));
+            return JSON.stringify(visit(value, 0));
+        } catch (_) { return "[Unserializable]"; }
+    }
+    function scheduleFrame(callback) {
+        if (state.destroyed) return;
+        if (typeof requestAnimationFrame !== "function") { callback(); return; }
+        const handle = requestAnimationFrame(() => {
+            state.frames.delete(handle);
+            if (!state.destroyed) callback();
+        });
+        state.frames.add(handle);
+    }
+    function trim(text, max) {
+        text = String(text);
+        return text.length > max ? `${text.slice(0, Math.max(0, max - 17))}[TRUNCATED]` : text;
+    }
+    function log(message, level = "INFO") {
+        if (state.destroyed) return;
+        const label = typeof level === "string" && /^(INFO|WARN|ERROR|DEBUG)$/i.test(level) ? level.toUpperCase() : "INFO";
+        const timestamp = new Date().toISOString();
+        const entry = trim(`[${timestamp}] [${label}] ${safeSerialize(message)}`, LIMITS.entry);
+        const size = entry.length + 1;
+        while (state.head < state.logs.length && state.length + size > LIMITS.buffer) {
+            state.length -= state.logs[state.head].length + 1;
+            state.logs[state.head++] = null; // Release pruned strings immediately.
+        }
+        if (state.head > 2048) { state.logs = state.logs.slice(state.head); state.head = 0; }
+        state.logs.push(entry);
+        state.length += size;
+        queueRender();
+    }
+    const info = message => log(message, "INFO");
+    const warn = message => log(message, "WARN");
+    const error = message => log(message, "ERROR");
+    function clear() {
+        state.logs.length = 0;
+        state.head = 0;
+        state.length = 0;
+        renderLogs();
+    }
+    function queueRender() {
+        if (!state.logArea || !state.root || state.root.hidden || state.panelMode !== "logs") return;
+        if (state.renderPending) return;
+        state.renderPending = true;
+        scheduleFrame(() => { state.renderPending = false; renderLogs(); });
+    }
+    function renderLogs() {
+        if (state.destroyed || !state.root || state.root.hidden || !state.logArea || !state.logArea.isConnected || state.panelMode !== "logs") return;
+        const subset = [];
+        let chars = 0;
+        for (let i = state.logs.length - 1; i >= state.head && subset.length < LIMITS.renderEntries; i--) {
+            if (chars + state.logs[i].length + 1 > LIMITS.renderChars) break;
+            subset.unshift(state.logs[i]); chars += state.logs[i].length + 1;
+        }
+        const skipped = state.logs.length - state.head - subset.length;
+        state.logArea.textContent = (skipped ? `[${skipped} earlier entries retained for copying]\n` : "") + subset.join("\n");
+        state.logArea.scrollTop = state.logArea.scrollHeight;
+    }
+
+    /* ---------- Clipboard (Tampermonkey, TornPDA, browser) ---------- */
+    function copyFallback(text) {
+        if (!document.body) return false;
+        const input = document.createElement("textarea");
+        const previousFocus = document.activeElement;
+        const selection = typeof window.getSelection === "function" ? window.getSelection() : null;
+        const ranges = [];
+        if (selection) for (let i = 0; i < selection.rangeCount; i++) ranges.push(selection.getRangeAt(i).cloneRange());
+        let caret = null;
+        try { if (previousFocus && typeof previousFocus.selectionStart === "number") caret = [previousFocus.selectionStart, previousFocus.selectionEnd, previousFocus.selectionDirection]; } catch (_) {}
+        input.value = text;
+        input.readOnly = true;
+        input.style.cssText = "position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;z-index:-1";
+        try {
+            document.body.appendChild(input);
+            input.focus();
+            input.select();
+            input.setSelectionRange(0, text.length);
+            return Boolean(document.execCommand("copy"));
+        } catch (_) { return false; }
+        finally {
+            input.remove();
+            try { if (previousFocus && previousFocus.isConnected) previousFocus.focus({ preventScroll: true });
+                if (caret) previousFocus.setSelectionRange(...caret);
+                if (selection) { selection.removeAllRanges(); ranges.forEach(range => selection.addRange(range)); } } catch (_) { /* Non-focusable element. */ }
+        }
+    }
+    async function writeClipboard(text) {
+        try {
+            if (typeof GM_setClipboard === "function") {
+                await Promise.resolve(GM_setClipboard(text, "text"));
+                return true;
+            }
+            if (typeof GM !== "undefined" && typeof GM.setClipboard === "function") {
+                await GM.setClipboard(text, "text");
+                return true;
+            }
+        } catch (_) { /* Try browser APIs. */ }
+        if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+            try { await navigator.clipboard.writeText(text); return true; }
+            catch (_) { /* Restricted WebView. */ }
+        }
+        return copyFallback(text);
+    }
+    function showCopyResult(button, result) {
+        if (state.destroyed || !button || !button.isConnected) return;
+        let saved = state.statuses.get(button);
+        if (saved) clearTimeout(saved.timer);
+        else saved = { nodes: Array.from(button.childNodes), timer: null };
+        button.textContent = result;
+        // This timer is only UI feedback, never element discovery or polling.
+        saved.timer = setTimeout(() => {
+            button.replaceChildren(...saved.nodes);
+            state.statuses.delete(button);
+        }, 1300);
+        state.statuses.set(button, saved);
+    }
+    async function copy(button = null) {
+        if (state.destroyed) return false;
+        const text = state.logs.slice(state.head).join("\n");
+        if (!text) { showCopyResult(button, "Empty"); return false; }
+        const success = await writeClipboard(text);
+        showCopyResult(button, success ? "Copied!" : "Failed");
+        if (!success) warn("Clipboard unavailable. Open debugger to select and copy manually.");
+        return success;
+    }
+
+    /* ---------- Safe DOM descriptions ---------- */
+    function isElement(node) { return Boolean(node && node.nodeType === 1 && node.tagName); }
+    function tag(node) { return isElement(node) ? node.tagName.toLowerCase() : "(none)"; }
+    function describe(node) {
+        if (!isElement(node)) return "(none)";
+        let text = tag(node);
+        const nodeId = node.getAttribute("id");
+        if (nodeId && !SENSITIVE.test(nodeId)) text += `#${trim(redact(nodeId), 50)}`;
+        const classes = Array.from(node.classList || []).filter(name => !SENSITIVE.test(name)).slice(0, 3);
+        if (classes.length) text += "." + classes.map(name => trim(redact(name), 48)).join(".");
+        return trim(text, 180);
+    }
+    function selectorSegment(node) {
+        if (!isElement(node)) return "";
+        const nodeId = node.getAttribute("id");
+        if (nodeId && /^[A-Za-z_][\w-]{0,60}$/.test(nodeId) && !SENSITIVE.test(nodeId)) {
+            return `#${nodeId}`;
+        }
+        let part = tag(node);
+        const classNames = Array.from(node.classList || [])
+            .filter(name => /^[A-Za-z_][\w-]{0,45}$/.test(name) && !SENSITIVE.test(name))
+            .slice(0, 2);
+        part += classNames.map(name => `.${name}`).join("");
+        if (node.parentElement) {
+            const same = Array.from(node.parentElement.children).filter(sibling => sibling.tagName === node.tagName);
+            if (same.length > 1) part += `:nth-of-type(${same.indexOf(node) + 1})`;
+        }
+        return part;
+    }
+    function makeSelector(element) {
+        const segments = [];
+        let current = element;
+        for (let step = 0; step < LIMITS.parents && isElement(current); step++) {
+            const segment = selectorSegment(current);
+            segments.unshift(segment);
+            if (segment.startsWith("#")) break;
+            current = current.parentElement;
+        }
+        const selector = segments.join(" > ");
+        if (selector.length > 500) return "(selector exceeds safe length)";
+        if (redact(selector) !== selector) return "(selector omitted: possible credential)";
+        return selector;
+    }
+    function safeAttributeText(element) {
+        const result = [];
+        if (!isElement(element)) return "";
+        for (const attr of Array.from(element.attributes || [])) {
+            if (!SAFE_ATTRIBUTES.has(attr.name) || SENSITIVE.test(attr.name)) continue;
+            if (SENSITIVE.test(attr.value)) continue;
+            result.push(`${attr.name}="${escapeHTML(trim(redact(attr.value), 90))}"`);
+            if (result.length >= 8) break;
+        }
+        return result.length ? ` ${result.join(" ")}` : "";
+    }
+    function escapeHTML(value) {
+        return String(value).replace(/[&<>"']/g, character => ({
+            "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+        })[character]);
+    }
+    function structuralHTML(element) {
+        let budget = LIMITS.nodes;
+        const skip = /^(script|style|noscript|template|iframe|object|embed)$/i;
+        function recurse(node, depth) {
+            if (!isElement(node) || budget-- <= 0) return "";
+            const name = tag(node);
+            const open = `<${name}${safeAttributeText(node)}>`;
+            if (skip.test(name)) return `${open}[contents omitted]</${name}>`;
+            if (depth >= 2) return `${open}[descendants omitted]</${name}>`;
+            const kids = Array.from(node.children).slice(0, LIMITS.children);
+            const nested = kids.map(child => recurse(child, depth + 1)).join("\n");
+            const note = node.children.length > LIMITS.children ? "\n[additional children omitted]" : "";
+            return `${open}${nested ? `\n${nested}${note}\n` : "[text omitted]"}</${name}>`;
+        }
+        return trim(recurse(element, 0), LIMITS.html);
+    }
+    function reactRootHint(element) {
+        let node = element;
+        for (let i = 0; i < LIMITS.parents && isElement(node); i++, node = node.parentElement) {
+            const candidateId = node.getAttribute("id") || "";
+            if (/^(?:react-root|root|__next)$/i.test(candidateId) || node.hasAttribute("data-reactroot")) {
+                return `${describe(node)} (heuristic only)`;
+            }
+        }
+        return "Not detected (does not rule out React)";
+    }
+    function getInspectionReport() {
+        const element = state.selected;
+        if (!isElement(element)) return "No element selected.";
+        const ancestors = [];
+        let ancestor = element.parentElement;
+        for (let i = 0; i < LIMITS.parents && isElement(ancestor); i++, ancestor = ancestor.parentElement) {
+            ancestors.push(`  ${i + 1}. ${describe(ancestor)}`);
+        }
+        const children = Array.from(element.children).slice(0, LIMITS.children)
+            .map((child, index) => `  ${index + 1}. ${describe(child)}`);
+        const page = typeof location !== "undefined"
+            ? (location.origin === "null" ? "(local document)" : `${location.origin}${location.pathname}`)
+            : "(unknown)";
+        return trim(redact([
+            `DOM INSPECTION | ${redact(String(scriptNamespace))}`,
+            `Time: ${new Date().toISOString()}`,
+            `Page (query omitted): ${redact(page)}`,
+            `Selected: ${describe(element)}`,
+            `Connected: ${element.isConnected}`,
+            `Selector (best effort): ${makeSelector(element)}`,
+            `React container hint: ${reactRootHint(element)}`,
+            `Parent chain:\n${ancestors.join("\n") || "  (none)"}`,
+            `Immediate children (${element.children.length}):\n${children.join("\n") || "  (none)"}`,
+            `Sibling context: previous=${describe(element.previousElementSibling)}, next=${describe(element.nextElementSibling)}`,
+            `Structural preview (text nodes, form values, URLs and scripts omitted; review attributes before sharing):\n${structuralHTML(element)}`,
+            `Recent observed mutations (${state.changeLog.length}):\n${state.changeLog.join("\n") || "  (none)"}`
+        ].join("\n\n")), LIMITS.report);
+    }
+
+    /* ---------- On-demand DOM selection and mutation watch ---------- */
+    function isOurUI(node) {
+        return Boolean(isElement(node) && (
+            (state.root && state.root.contains(node)) ||
+            (state.highlight && state.highlight.contains(node))
+        ));
+    }
+    function ensureHighlight() {
+        if (state.destroyed || !state.selected || !state.root || state.root.hidden || state.panelMode !== "inspect") return null;
+        if (state.highlight && state.highlight.isConnected) return state.highlight;
+        if (!document.body) return null;
+        const node = document.createElement("div");
+        node.setAttribute("aria-hidden", "true");
+        node.style.cssText = "position:fixed;pointer-events:none;z-index:2147483646;border:2px solid #00dbff;box-shadow:0 0 0 1px #001e28;box-sizing:border-box;display:none";
+        document.body.appendChild(node);
+        state.highlight = node;
+        return node;
+    }
+    function updateHighlight() {
+        const marker = ensureHighlight();
+        if (!marker) return;
+        const node = state.selected;
+        if (!isElement(node) || !node.isConnected || !state.root || state.root.hidden || state.panelMode !== "inspect") {
+            marker.style.display = "none";
+            return;
+        }
+        const rect = node.getBoundingClientRect();
+        marker.style.display = "block";
+        marker.style.top = `${rect.top}px`;
+        marker.style.left = `${rect.left}px`;
+        marker.style.width = `${rect.width}px`;
+        marker.style.height = `${rect.height}px`;
+    }
+    function onViewportChanged() {
+        if (state.destroyed || !state.selected || state.highlightPending || state.panelMode !== "inspect") return;
+        state.highlightPending = true;
+        scheduleFrame(() => {
+            state.highlightPending = false;
+            updateHighlight();
+        });
+    }
+    function setViewportListeners(enable) {
+        if (typeof window === "undefined" || enable === state.viewportListeners) return;
+        state.viewportListeners = enable;
+        const method = enable ? "addEventListener" : "removeEventListener";
+        window[method]("scroll", onViewportChanged, true);
+        window[method]("resize", onViewportChanged);
+    }
+    function removeHighlight() {
+        if (state.highlight) { state.highlight.remove(); state.highlight = null; }
+    }
+    function updateInspector() {
+        if (!state.inspectorText) return;
+        state.inspectorText.textContent = state.selected ? trim([
+            `Selected: ${describe(state.selected)}`,
+            `Parent: ${describe(state.selected.parentElement)}`,
+            `Children: ${state.selected.children.length}`,
+            `Selector: ${makeSelector(state.selected)}`,
+            `Connected: ${state.selected.isConnected}`,
+            `Watch: ${state.watching ? "ON" : "OFF"} | Changes: ${state.changeLog.length}`
+        ].join("\n"), 1100) : "Tap Pick, then tap a Torn page element.\nNo page data is collected until inspection is used.";
+        if (state.statusBar) state.statusBar.textContent = state.picking ? "PICK MODE: tap a page element or press Esc" : "Inspector idle";
+        updateHighlight();
+    }
+    function suppressPickAction(event) {
+        if (isOurUI(event.target)) return;
+        event.stopImmediatePropagation();
+        // Preserve the browser synthetic click needed for tap selection.
+    }
+    function onPickClick(event) {
+        if (isOurUI(event.target)) return;
+        // Capture before Torn/React click handlers so selecting a link does not navigate.
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (isElement(event.target)) inspectElement(event.target);
+        stopPicker();
+    }
+    function onPickKey(event) {
+        if (event.key === "Escape") {
+            event.preventDefault();
+            stopPicker();
+            updateInspector();
+        }
+    }
+    function startPicker() {
+        if (state.destroyed || !state.root || !state.root.isConnected || state.root.hidden || state.picking) return;
+        state.picking = true;
+        document.addEventListener("click", onPickClick, true);
+        ["pointerdown", "pointerup", "touchstart", "touchend", "mousedown", "mouseup"].forEach(type => document.addEventListener(type, suppressPickAction, { capture: true, passive: false }));
+        document.addEventListener("keydown", onPickKey, true);
+        updateInspector();
+    }
+    function stopPicker() {
+        if (!state.picking) return;
+        state.picking = false;
+        document.removeEventListener("click", onPickClick, true);
+        ["pointerdown", "pointerup", "touchstart", "touchend", "mousedown", "mouseup"].forEach(type => document.removeEventListener(type, suppressPickAction, true));
+        document.removeEventListener("keydown", onPickKey, true);
+        updateInspector();
+    }
+    function stopWatch() {
+        if (state.observer) state.observer.disconnect();
+        if (state.parentObserver) state.parentObserver.disconnect();
+        state.observer = null;
+        state.parentObserver = null;
+        state.watching = false;
+        state.pendingMutations = 0;
+        updateInspector();
+    }
+    function handleMutations(mutations) {
+        if (!state.watching) return;
+        const stamp = new Date().toISOString();
+        let changed = 0;
+        for (const mutation of mutations) {
+            if (changed >= 8) break;
+            const detail = mutation.type === "characterData" ? "text node changed (content omitted)" : mutation.type === "attributes"
+                ? `attribute ${mutation.attributeName} on ${describe(mutation.target)}`
+                : `childList (+${mutation.addedNodes.length}/-${mutation.removedNodes.length}) on ${describe(mutation.target)}`;
+            state.changeLog.push(`[${stamp}] ${detail}`);
+            changed++;
+        }
+        while (state.changeLog.length > LIMITS.mutations) state.changeLog.shift();
+        if (changed) {
+            state.pendingMutations += changed;
+            if (!state.mutationLogPending) {
+                state.mutationLogPending = true;
+                scheduleFrame(() => {
+                    state.mutationLogPending = false;
+                    const count = state.pendingMutations;
+                    state.pendingMutations = 0;
+                    if (count && state.watching) log(`DOM watch: ${count} sampled change(s) near ${describe(state.selected)}`, "DEBUG");
+                });
+            }
+        }
+        if (state.selected && !state.selected.isConnected) {
+            warn(`DOM watch: selected element detached: ${describe(state.selected)}`);
+            stopWatch();
+        }
+        updateInspector();
+    }
+    function watchElement(element = state.selected) {
+        if (state.destroyed || !isElement(element) || !element.isConnected || element === document.documentElement || element === document.body) {
+            warn("DOM watch requires a specific element, not the document root/body.");
+            return false;
+        }
+        if (typeof MutationObserver === "undefined") {
+            warn("MutationObserver is unavailable in this WebView.");
+            return false;
+        }
+        stopWatch();
+        if (element !== state.selected && !inspectElement(element)) return false;
+        state.changeLog.length = 0;
+        // Observe the chosen subtree and direct child lists along its ancestor chain.
+        state.observer = new MutationObserver(handleMutations);
+        state.observer.observe(element, {
+            attributes: true, childList: true, characterData: true, subtree: true,
+            attributeFilter: ["class", "id", "role", "aria-expanded", "hidden", "disabled", "data-state"]
+        });
+        if (element.parentElement) {
+            state.parentObserver = new MutationObserver(handleMutations);
+            let ancestor = element.parentElement;
+            while (ancestor) {
+                state.parentObserver.observe(ancestor, { childList: true });
+                ancestor = ancestor.parentNode;
+            }
+        }
+        state.watching = true;
+        info(`DOM watch enabled: ${describe(element)}`);
+        updateInspector();
+        return true;
+    }
+    function moveSelection(direction) {
+        const selected = state.selected;
+        if (!isElement(selected)) return;
+        const next = direction === "parent" ? selected.parentElement : selected.firstElementChild;
+        if (next && next !== document.body && next !== document.documentElement) inspectElement(next);
+    }
+    function inspectElement(element) {
+        if (state.destroyed || !isElement(element) || isOurUI(element) || !ensureUI()) return false;
+        if (state.watching && state.selected !== element) stopWatch();
+        state.selected = element;
+        if (state.resizeObserver) state.resizeObserver.disconnect();
+        if (typeof ResizeObserver === "function") {
+            state.resizeObserver = new ResizeObserver(onViewportChanged);
+            state.resizeObserver.observe(element);
+        }
+        state.changeLog.length = 0;
+        showPanel("inspect");
+        updateInspector();
+        info(`DOM selected: ${describe(element)} | ${makeSelector(element)}`);
+        return true;
+    }
+    function inspect() {
+        if (!showPanel("inspect")) return false;
+        startPicker();
+        return true;
+    }
+    function stopInspection() {
+        stopPicker();
+        stopWatch();
+        state.selected = null;
+        if (state.resizeObserver) state.resizeObserver.disconnect();
+        state.resizeObserver = null;
+        state.changeLog.length = 0;
+        removeHighlight();
+        setViewportListeners(false);
+        if (state.root && !state.root.hidden) showPanel("logs");
+    }
+    async function copyInspection(button = null) {
+        if (state.destroyed) return false;
+        if (!state.selected) { showCopyResult(button, "No selection"); return false; }
+        const result = await writeClipboard(getInspectionReport());
+        showCopyResult(button, result ? "Copied!" : "Failed");
+        return result;
+    }
+
+    /* ---------- Compact UI, created on first use ---------- */
+    function createButton(text, label, handler) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = text;
+        button.title = label;
+        button.setAttribute("aria-label", label);
+        button.className = `${id}-btn`;
+        button.addEventListener("click", handler);
+        return button;
+    }
+    function ensureStyles() {
+        if (state.destroyed) return;
+        if (state.style && state.style.isConnected) return;
+        if (!document.head && !document.body) return;
+        const style = document.createElement("style");
+        style.id = `${id}-styles`;
+        style.textContent = `
+          @keyframes ${id}-reset {from{opacity:.7}to{opacity:1}}
+          .${id}-flash{animation:${id}-reset 1.3s ease 1}
+          #${id}{position:fixed;right:12px;bottom:12px;width:min(430px,calc(100vw - 24px));
+            height:320px;max-height:70vh;display:flex;flex-direction:column;gap:8px;padding:10px;
+            background:#191919;color:#e2ffe7;border:1px solid #46db85;border-radius:8px;
+            box-shadow:0 6px 25px #0009;box-sizing:border-box;font:12px/1.45 monospace;
+            z-index:2147483647;touch-action:manipulation}
+          #${id}[hidden],#${id} [hidden]{display:none!important}
+          #${id} button{font:11px/1.2 sans-serif;min-height:30px;cursor:pointer}
+          #${id} .${id}-btn{border:1px solid #616161;border-radius:4px;background:#292929;
+            color:#fff;padding:6px;touch-action:manipulation}
+          #${id} .${id}-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px}
+          #${id} .${id}-title{font-weight:bold;flex:1 1 120px;min-width:0;overflow:hidden;text-overflow:ellipsis}
+          #${id} .${id}-body{flex:1;min-height:0;overflow:auto;white-space:pre-wrap;
+            overflow-wrap:anywhere;user-select:text}
+          #${id} .${id}-actions{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:5px}
+          #${id} .${id}-status{font-size:11px;color:#ace3fc}
+          #${id} button:focus-visible{outline:2px solid #91dfff;outline-offset:2px}
+          @media(max-width:480px){#${id}{right:8px;bottom:8px;width:calc(100vw - 16px);
+            height:290px;font-size:11px}}
+          @media(prefers-reduced-motion:reduce){.${id}-flash{animation:none}}
+        `;
+        (document.head || document.body).appendChild(style);
+        state.style = style;
+    }
+    function ensureUI() {
+        if (state.destroyed) return false;
+        if (state.root && state.root.isConnected) { ensureStyles(); return true; }
+        if (!document.body) return false;
+        ensureStyles();
+        const root = document.createElement("section");
+        root.id = id;
+        root.hidden = true;
+        root.setAttribute("aria-label", `Debug console: ${String(scriptNamespace)}`);
+        const toolbar = document.createElement("div");
+        toolbar.className = `${id}-toolbar`;
+        const title = document.createElement("span");
+        title.className = `${id}-title`;
+        title.textContent = `🪲 ${String(scriptNamespace)}`;
+        toolbar.append(title,
+            createButton("Copy", "Copy logs", function () { void copy(this); }),
+            createButton("Clear", "Clear logs", clear),
+            createButton("🔍", "Inspect Torn DOM element", inspect),
+            createButton("Hide", "Hide debugger", () => toggleView()));
+        const logArea = document.createElement("pre");
+        logArea.className = `${id}-body`;
+        logArea.style.margin = "0";
+        const inspector = document.createElement("div");
+        inspector.className = `${id}-body`;
+        inspector.hidden = true;
+        const actions = document.createElement("div");
+        actions.className = `${id}-actions`;
+        actions.append(
+            createButton("Pick", "Pick element by tapping it", startPicker),
+            createButton("↑ Parent", "Inspect parent element", () => moveSelection("parent")),
+            createButton("↓ Child", "Inspect first child element", () => moveSelection("child")),
+            createButton("Watch", "Watch selected element for DOM mutations", () => { watchElement(); }),
+            createButton("Stop watch", "Disconnect mutation observers", stopWatch),
+            createButton("Copy DOM", "Copy sanitized DOM report", function () { void copyInspection(this); }),
+            createButton("Exit", "Close inspector", stopInspection));
+        const status = document.createElement("div");
+        status.className = `${id}-status`;
+        const details = document.createElement("pre");
+        details.style.cssText = "white-space:pre-wrap;overflow-wrap:anywhere;margin:5px 0;font:inherit";
+        inspector.append(actions, status, details);
+        root.append(toolbar, logArea, inspector);
+        document.body.appendChild(root);
+        Object.assign(state, { root, logArea, inspector, inspectorText: details, statusBar: status });
+        attachUIObserver();
+        return true;
+    }
+    function attachUIObserver() {
+        if (typeof MutationObserver === "undefined" || !document.body) return;
+        if (state.uiObserver) state.uiObserver.disconnect();
+        // Only direct children of body, not the constantly changing React subtree.
+        state.uiObserver = new MutationObserver(() => {
+            if (state.root && (!state.root.isConnected || state.observedBody !== document.body)) {
+                stopPicker();
+                stopWatch();
+                removeHighlight();
+                setViewportListeners(false);
+                if (state.root) state.root.remove();
+                if (state.resizeObserver) state.resizeObserver.disconnect();
+                state.resizeObserver = null;
+                state.selected = null;
+                state.root = state.logArea = state.inspector = state.inspectorText = state.statusBar = null;
+                state.uiObserver.disconnect();
+            }
+        });
+        state.uiObserver.observe(document.body, { childList: true });
+        if (document.documentElement) state.uiObserver.observe(document.documentElement, { childList: true });
+        state.observedBody = document.body;
+    }
+    function showPanel(panel) {
+        if (!ensureUI()) return false;
+        state.root.hidden = false;
+        state.panelMode = panel;
+        setViewportListeners(panel === "inspect");
+        state.logArea.hidden = panel !== "logs";
+        state.inspector.hidden = panel !== "inspect";
+        if (panel === "logs") renderLogs();
+        else updateInspector();
+        return true;
+    }
+    function toggleView() {
+        if (!ensureUI()) return false;
+        if (!state.root.hidden) {
+            // A hidden debugger must not keep an active DOM picker or watch.
+            stopInspection();
+            state.root.hidden = true;
+            return false;
+        }
+        showPanel("logs");
+        return true;
+    }
+
+    function destroy() {
+        if (state.destroyed) return;
+        state.destroyed = true;
+        stopInspection();
+        if (state.uiObserver) state.uiObserver.disconnect();
+        if (state.resizeObserver) state.resizeObserver.disconnect();
+        for (const handle of state.frames) {
+            if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(handle);
+        }
+        state.frames.clear();
+        for (const [button, saved] of state.statuses) {
+            clearTimeout(saved.timer);
+            button.replaceChildren(...saved.nodes);
+        }
+        state.statuses.clear();
+        if (state.root) state.root.remove();
+        if (state.style) state.style.remove();
+        removeHighlight();
+        state.root = state.logArea = state.inspector = state.inspectorText = state.statusBar = state.style = null;
+        clear();
+    }
+
+    return Object.freeze({
+        log, info, warn, error, copy, clear, toggleView,
+        inspect, inspectElement, watchElement, stopInspection,
+        getInspectionReport, copyInspection, destroy
+    });
+}
+
+// END SUPPLIED DEBUGGER MODULE
+
+    void boot().catch(error => MyDebug.log({ event: "Startup failed", message: error.message }, "ERROR"));
+})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.0.2" } });
