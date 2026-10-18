@@ -1,17 +1,25 @@
 // ==UserScript==
 // @name         Torn-Inventory-Compare
 // @namespace    https://github.com/ShavedW00kie/
-// @version      1.0.6
-// @description  Compare individual inventory weapon and armor stats with the equipped or chosen item in the same slot. Includes temporary effects, coverage, settings and diagnostics.
+// @version      1.1.0
+// @description  Compare actual weapon and armor stats in inventory, item market and bazaars against matching equipped gear. Includes lower-stat filters, effects, coverage and diagnostics.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
 // @homepageURL  https://github.com/ShavedW00kie/
 // @supportURL   https://greasyfork.org/en/users/1597765-shavedw00kie
 // @match        https://www.torn.com/item.php*
 // @match        https://torn.com/item.php*
-// @run-at       document-end
+// @match        https://www.torn.com/bazaar.php*
+// @match        https://torn.com/bazaar.php*
+// @match        https://www.torn.com/imarket.php*
+// @match        https://torn.com/imarket.php*
+// @match        https://www.torn.com/page.php*
+// @match        https://torn.com/page.php*
+// @run-at       document-start
+// @sandbox      raw
 // @noframes
 // @grant        GM_info
+// @grant        unsafeWindow
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
@@ -42,13 +50,21 @@
 (function (GM_info) {
     "use strict";
 
+    function pageMode() {
+        const path = location.pathname.toLowerCase();
+        if (path === "/item.php") return "inventory";
+        if (path === "/bazaar.php") return "bazaar";
+        if (path === "/imarket.php" || (path === "/page.php" && /^(?:itemmarket|imarket)$/i.test(new URLSearchParams(location.search).get("sid") || ""))) return "market";
+        return "";
+    }
+    if (!pageMode()) return;
     const MyDebug = initializeModularDebugger(GM_info.script.name);
-    const VERSION = "1.0.6";
+    const VERSION = "1.1.0";
     const P = "tw-ic-";
     if (document.getElementById(P + "active")) return;
     const marker = document.createElement("meta");
     marker.id = P + "active";
-    (document.head || document.documentElement).appendChild(marker);
+    if (document.documentElement) (document.head || document.documentElement).appendChild(marker);
 
     const API = "https://api.torn.com/v2/";
     const TTL = { catalog: 86400000, detail: 21600000, inventory: 3600000 };
@@ -56,6 +72,7 @@
         enabled: true, showValues: true, showDeltas: false, showRoF: true,
         showEffects: true, fontSize: 11, arrowSize: 18, effectSize: 22, layout: "inline",
         upColor: "#79e6a5", downColor: "#99d9ff",
+        hideLowerDamage: false, hideLowerAccuracy: false, hideLowerArmor: false, hideLowerCoverage: false,
         referenceMode: "equipped", coverageArea: "slot", armorSlots: {}
     });
     const GROUPS = ["Primary", "Secondary", "Melee", "Temporary", "head", "body", "hands", "legs", "feet", "fullbody"];
@@ -69,6 +86,11 @@
     const NATIVE_LISTS = "ul.items-cont,ol.items-cont,ul[id$='-items'],ol[id$='-items'],#all-items";
     const NATIVE_ROWS = NATIVE_LISTS.split(",").map(selector => selector + " > li").join(",");
     const ROWS = ITEM_MARKERS + "," + NATIVE_ROWS;
+    const SHOP_NATIVE_ROWS = '[class*="sellerList__"] > li,[class*="sellerRow__"],[class*="rowItems__"] > [class*="item__"],.items-list > li,.market-listing,.bazaar-item';
+    const SHOP_ROWS = SHOP_NATIVE_ROWS + ',[data-listing-id],[data-bazaar-id]';
+    const ROOTS = { inventory: "div.items-wrap,.items-wrap,#all-items", market: "#item-market-root,#itemmarket,.item-market-wrap",
+        bazaar: '#bazaarroot,#bazaar-root,.bazaar-main-wrap,[class*="itemsContainner__"]' };
+    const FILTER_KEYS = ["hideLowerDamage", "hideLowerAccuracy", "hideLowerArmor", "hideLowerCoverage"];
     const state = {
         opts: { ...DEFAULTS }, key: "", epoch: 0, queue: Promise.resolve(), writes: Promise.resolve(),
         catalogs: new Map(), details: new Map(), inventories: new Map(), equipment: [],
@@ -79,7 +101,8 @@
         blocked: "", blockedUntil: 0, failures: new Map(), catalogAttempts: new Map(),
         progress: "", notice: "", autoOpened: false, alive: true, requestAbort: new AbortController(),
         previousFocus: null, scanned: 0, loaded: 0, lastReferences: "", fallbackStorage: false,
-        rowCandidates: 0, lastRowResolution: "", lastLayout: "", layoutFrame: 0
+        rowCandidates: 0, lastRowResolution: "", lastLayout: "", layoutFrame: 0,
+        mode: pageMode(), hiddenCount: 0, resetFilters: null, listingData: new Map(), listingIds: new Map(), observedFetch: false
     };
 
     const number = value => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
@@ -137,7 +160,7 @@
     function sanitizeOptions(input) {
         const o = { ...DEFAULTS };
         if (!input || typeof input !== "object") return o;
-        for (const k of ["enabled", "showValues", "showDeltas", "showRoF", "showEffects"]) if (typeof input[k] === "boolean") o[k] = input[k];
+        for (const k of ["enabled", "showValues", "showDeltas", "showRoF", "showEffects", ...FILTER_KEYS]) if (typeof input[k] === "boolean") o[k] = input[k];
         if (["equipped", "selected"].includes(input.referenceMode)) o.referenceMode = input.referenceMode;
         if (["slot", ...AREAS].includes(input.coverageArea)) o.coverageArea = input.coverageArea;
         o.fontSize = Math.max(9, Math.min(15, number(input.fontSize) || 11));
@@ -313,6 +336,13 @@
     }
     function statsFor(model) {
         const catalog = catalogEntry(model.id);
+        if (model.shopping && groupOf(catalog) !== "Temporary") {
+            const viewed = model.listingStats || (model.uid && state.listingData.get(model.id + ":" + model.uid));
+            if (fresh(viewed, TTL.detail)) {
+                const cached = model.uid && state.details.get(model.uid);
+                return { ...viewed, bonuses: viewed.bonuses.length ? viewed.bonuses : cached?.id === model.id ? cached.bonuses : [], stale: false };
+            }
+        }
         if (model.uid) {
             const detail = state.details.get(model.uid);
             if (detail && String(detail.id) === String(model.id)) {
@@ -400,6 +430,169 @@
         return { id, uid, weak, name: name || "Item " + id, row, group: groupOf(catalog), equipped: isEquipped(row) };
     }
     function inventoryCategory(group) { return Object.keys(SLOT_AREA).includes(group) ? "Defensive" : group; }
+    function marketItemId() {
+        const query = new URLSearchParams(location.search), hash = new URLSearchParams(location.hash.replace(/^#\/?/, ""));
+        return uidOf(hash.get("itemID") || hash.get("itemId") || query.get("itemID") || query.get("itemId"));
+    }
+    function listingScope() {
+        return state.mode === "bazaar" ? "bazaar:" + (uidOf(new URLSearchParams(location.search).get("userId")) || "self") : "market:" + marketItemId();
+    }
+    function listingRecord(raw, hint = "", mode = state.mode) {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+        const copy = raw.item_details || raw.itemDetails || raw;
+        const id = uidOf(raw.itemID || raw.itemId || raw.item_id || raw.item?.id || hint || (raw.uid && raw.stats ? raw.id : ""));
+        if (!id) return null;
+        const uid = uidOf(copy.uid || copy.UID || raw.armoryID || raw.armouryID || raw.armoryId || raw.itemUid);
+        let stats = copy.stats;
+        if (!stats && copy !== raw && uid) stats = { damage: copy.damage ?? copy.dmg, accuracy: copy.accuracy ?? copy.acc, armor: copy.armor ?? copy.arm };
+        // Native bazaar responses carry rolled dmg/acc/arm alongside separate
+        // base damage/accuracy fields. Only the rolled fields are accepted.
+        if (!stats && (raw.itemID || raw.itemId) && ("dmg" in raw || "acc" in raw || "arm" in raw)) stats = { damage: raw.dmg, accuracy: raw.acc, armor: raw.arm };
+        const rating = value => number(value) !== null && number(value) >= 0 ? number(value) : null;
+        const record = { id, uid, listingId: uidOf(raw.bazaarID || raw.listingID || raw.listingId || raw.listing_id),
+            damage: rating(stats?.damage), accuracy: rating(stats?.accuracy), armor: rating(stats?.armor), quality: rating(stats?.quality),
+            bonuses: Array.isArray(copy.bonuses) ? copy.bonuses.filter(b => b && typeof b === "object" && (b.title || b.name)) : [],
+            at: Date.now(), source: mode === "bazaar" ? "Viewed bazaar listing" : "Viewed market listing" };
+        return record;
+    }
+    function hasRatings(record) { return Boolean(record && [record.damage, record.accuracy, record.armor].some(v => number(v) !== null)); }
+    function rememberListing(record, scope) {
+        if (!record) return;
+        if (record.uid && hasRatings(record)) state.listingData.set(record.id + ":" + record.uid, record);
+        if (record.listingId) state.listingIds.set(scope + ":" + record.listingId, record);
+        for (const map of [state.listingData, state.listingIds]) while (map.size > 2000) map.delete(map.keys().next().value);
+    }
+    function observeListingResponse(data, context) {
+        if (!data || typeof data !== "object") return;
+        const list = Array.isArray(data.list) ? data.list : Array.isArray(data.listings) ? data.listings : data.itemmarket?.listings;
+        if (!Array.isArray(list)) return;
+        let accepted = 0;
+        for (const raw of list) {
+            const record = listingRecord(raw, uidOf(data.itemmarket?.item?.id) || context.id, context.mode);
+            if (!record) continue;
+            rememberListing(record, context.scope); accepted++;
+        }
+        if (accepted) { log("Native listings observed", { surface: context.mode, accepted }); schedule(); }
+    }
+    function installListingObserver() {
+        if (state.mode === "inventory") return;
+        // Observe only listing responses the page already requests. No extra
+        // authenticated site requests, injected scripts, or buy actions.
+        try {
+            const page = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+            const original = page.fetch;
+            if (typeof original !== "function") return;
+            const observeFetch = function (...args) {
+                let context = null;
+                try {
+                    const url = new URL(typeof args[0] === "string" ? args[0] : args[0]?.url, location.href), step = url.searchParams.get("step");
+                    if (url.origin === location.origin && ((url.pathname === "/bazaar.php" && step === "getBazaarItems") ||
+                        (url.pathname === "/page.php" && /^(?:imarket|itemmarket)$/i.test(url.searchParams.get("sid") || "") && step === "getListing"))) {
+                        const mode = url.pathname === "/bazaar.php" ? "bazaar" : "market";
+                        let body = args[1]?.body, id = uidOf(url.searchParams.get("itemID"));
+                        if (typeof body === "string") { try { body = JSON.parse(body); } catch (_) { body = new URLSearchParams(body); } }
+                        if (!id) id = uidOf(typeof body?.get === "function" ? body.get("itemID") : body?.itemID) || marketItemId();
+                        context = { mode, id, scope: mode === "bazaar" ? listingScope() : "market:" + id };
+                    }
+                } catch (_) { /* Unrelated requests are passed through untouched. */ }
+                const pending = Reflect.apply(original, this, args);
+                if (context) void Promise.resolve(pending).then(response => {
+                    if (!response.ok) return;
+                    return response.clone().json().then(data => observeListingResponse(data, context));
+                }).catch(() => {});
+                return pending;
+            };
+            page.fetch = typeof exportFunction === "function" ? exportFunction(observeFetch, page) : observeFetch;
+            state.observedFetch = true;
+        } catch (_) { log("Native listing observer unavailable; using row metadata", {}, "DEBUG"); }
+    }
+    function rowListingObjects(row) {
+        const objects = [], queue = [], seen = new Set();
+        const push = (value, depth = 0, children = true) => { if (value && typeof value === "object" && !Array.isArray(value) && !seen.has(value)) { seen.add(value); queue.push({ value, depth, children }); } };
+        const nodes = [row, ...Array.from(row.querySelectorAll("div,span,li,button,[data-item-details],[data-item-info]")).filter(n => !owned(n)).slice(0, 20)];
+        for (const node of nodes) {
+            for (const attr of ["data-item-details", "data-item-info", "data-info"]) {
+                const value = node.getAttribute(attr); if (value?.startsWith("{")) try { push(JSON.parse(value)); } catch (_) {}
+            }
+            // Read only this rendered card's data props. No state changes,
+            // component invocation, or traversal through whole inventory arrays.
+            try {
+                const rendered = node.wrappedJSObject || node;
+                for (const key of Object.getOwnPropertyNames(rendered)) {
+                    if (key.startsWith("__reactProps$")) push(rendered[key]);
+                    if (node === row && key.startsWith("__reactFiber$")) {
+                        let fiber = rendered[key];
+                        for (let i = 0; fiber && i < 3; i++, fiber = fiber.return) push(fiber.memoizedProps, 0, false);
+                    }
+                }
+            } catch (_) {}
+        }
+        while (queue.length && objects.length < 120) {
+            const { value, depth, children } = queue.shift(); objects.push(value);
+            if (depth >= 4) continue;
+            for (const key of ["item", "listing", "data", "itemInfo", "itemData", "bazaarItem", "itemDetails", "item_details", "props", ...(children ? ["children"] : [])]) {
+                try { push(value[key], depth + 1, children); } catch (_) {}
+            }
+        }
+        return objects;
+    }
+    function shoppingRow(node) {
+        if (!(node instanceof Element) || owned(node)) return null;
+        const row = node.closest(SHOP_NATIVE_ROWS) || node.closest('[data-listing-id],[data-bazaar-id]');
+        if (!row || !state.root?.contains(row)) return null;
+        if (row.matches('a,button,input,select,option,label,[role="button"]')) return null;
+        const seller = row.closest('[class*="sellerList__"] > li');
+        return seller || row;
+    }
+    function itemOwner(node) { return state.mode === "inventory" ? inventoryRow(node) : shoppingRow(node); }
+    function rowVisible(row) {
+        // Brief synchronous removal lets native filters remain authoritative.
+        // This private attribute is deliberately outside the observer filter.
+        const hidden = row.getAttribute("data-tw-ic-filtered");
+        if (hidden !== null) row.removeAttribute("data-tw-ic-filtered");
+        const visible = row.getClientRects().length > 0 && getComputedStyle(row).visibility !== "hidden";
+        if (hidden !== null) row.setAttribute("data-tw-ic-filtered", hidden);
+        return visible;
+    }
+    function readShoppingRow(row) {
+        const objects = rowListingObjects(row), idSet = new Set(), uidSet = new Set(), listingIds = new Set();
+        const metadata = [row, ...Array.from(row.querySelectorAll(IDENTITY_MARKERS + ",[data-item-uid],[data-armory-id],[data-armoury-id],[data-listing-id],[data-bazaar-id]")).filter(n => !owned(n))];
+        for (const node of metadata) {
+            const id = itemId(node); if (id) idSet.add(id);
+            for (const attr of [...UID_ATTRS, "data-item-uid", "data-armory-id", "data-armoury-id"]) { const uid = uidOf(node.getAttribute(attr)); if (uid) uidSet.add(uid); }
+            for (const attr of ["data-listing-id", "data-bazaar-id"]) { const id = uidOf(node.getAttribute(attr)); if (id) listingIds.add(id); }
+        }
+        for (const img of row.querySelectorAll("img[src],img[srcset]")) {
+            const match = (img.getAttribute("src") || "").match(/\/images\/items\/(\d+)\//) || (img.getAttribute("srcset") || "").match(/\/images\/items\/(\d+)\//);
+            if (match) idSet.add(match[1]);
+        }
+        for (const raw of objects) {
+            const id = uidOf(raw.itemID || raw.itemId || raw.item_id); if (id) idSet.add(id);
+            const copy = raw.item_details || raw.itemDetails || raw;
+            const uid = uidOf(copy.uid || copy.UID || raw.armoryID || raw.armouryID || raw.armoryId || raw.itemUid); if (uid) uidSet.add(uid);
+        }
+        // A known UID identifies its catalog item even while a hash navigation
+        // is replacing the old seller list with a different item type.
+        if (!idSet.size) for (const uid of uidSet) {
+            const known = state.details.get(uid) || [...state.listingData.values()].find(record => record.uid === uid);
+            if (known) idSet.add(known.id);
+        }
+        const hint = idSet.size === 1 ? [...idSet][0] : state.mode === "market" ? marketItemId() : "";
+        let records = objects.map(raw => listingRecord(raw, hint)).filter(Boolean);
+        for (const record of records) { idSet.add(record.id); if (record.uid) uidSet.add(record.uid); if (record.listingId) listingIds.add(record.listingId); }
+        for (const id of listingIds) {
+            const record = state.listingIds.get(listingScope() + ":" + id);
+            if (record) { records.push(record); idSet.add(record.id); if (record.uid) uidSet.add(record.uid); }
+        }
+        if (!idSet.size && hint) idSet.add(hint);
+        if (idSet.size !== 1) return null;
+        const id = [...idSet][0], uid = uidSet.size === 1 ? [...uidSet][0] : "", catalog = catalogEntry(id);
+        // Multiple copy identities within one supposed card are ambiguous.
+        records = uidSet.size > 1 ? [] : records.filter(r => r.id === id && (!r.uid || !uid || r.uid === uid) && hasRatings(r));
+        const listingStats = records[0] || null;
+        if (listingStats?.uid) rememberListing(listingStats, listingScope());
+        return { id, uid, weak: "", name: catalog?.name || "Item " + id, group: groupOf(catalog), row, equipped: false, listingStats, shopping: true };
+    }
     function nameHost(row) {
         // Mount only inside this item's name area. The v1.0.5 ownership check
         // keeps repeated action metadata from becoming independent rows.
@@ -408,6 +601,7 @@
             !node.closest('a,button,label,[role="button"],[contenteditable="true"]')) || null;
     }
     function rowHost(row, model) {
+        if (model.shopping) return row;
         if (state.opts.layout === "inline") {
             const host = nameHost(row);
             if (host) return host;
@@ -455,10 +649,11 @@
         else row.querySelectorAll("." + P + "wrap").forEach(n => n.remove());
         if (row.classList.contains(P + "annotated")) row.classList.remove(P + "annotated");
         if (row.hasAttribute("data-tw-ic-mount")) row.removeAttribute("data-tw-ic-mount");
+        row.removeAttribute("data-tw-ic-filtered");
         inlineClasses(row, null);
         state.rowModels.delete(row);
     }
-    function findRoot() { return document.querySelector("div.items-wrap,.items-wrap,#all-items"); }
+    function findRoot() { return state.mode ? document.querySelector(ROOTS[state.mode]) : null; }
     function owned(node) { const e = node && (node.nodeType === 1 ? node : node.parentElement); return Boolean(e && e.closest && e.closest("[data-tw-ic-owned]")); }
     function schedule() {
         if (!state.alive || state.frame) return;
@@ -467,6 +662,7 @@
     function attachRoot(root) {
         if (state.root === root) return;
         if (state.inventoryObserver) state.inventoryObserver.disconnect();
+        if (state.root) for (const row of state.root.querySelectorAll("." + P + "annotated,[data-tw-ic-filtered]")) releaseRow(row);
         state.root = root;
         if (!root) return;
         state.inventoryObserver = new MutationObserver(records => {
@@ -474,10 +670,30 @@
                 [...m.removedNodes].some(n => n.nodeType === 1 && n.matches("." + P + "wrap"))))) schedule();
         });
         state.inventoryObserver.observe(root, { childList: true, subtree: true, attributes: true, characterData: true,
-            attributeFilter: ["class", "data-equipped", "data-id", ...ITEM_ATTRS, ...UID_ATTRS, "hidden", "aria-selected", "title", "aria-label", "data-action", "data-tooltip"] });
-        log("Inventory container found", { selector: root.id ? "#" + root.id : ".items-wrap" });
+            attributeFilter: ["class", "style", "data-equipped", "data-id", ...ITEM_ATTRS, ...UID_ATTRS, "data-item-uid", "data-armory-id", "data-listing-id", "data-bazaar-id", "data-item-info", "data-item-details", "data-info", "src", "srcset", "hidden", "aria-selected", "title", "aria-label", "data-action", "data-tooltip"] });
+        log("Inventory container found", { surface: state.mode, selector: root.id ? "#" + root.id : ROOTS[state.mode] });
+    }
+    function equippedReferences(models) {
+        const result = new Map();
+        for (const group of GROUPS) {
+            if (state.mode === "inventory") {
+                const marked = models.filter(m => m.group === group && m.equipped);
+                const unique = [...new Map(marked.map(m => [m.uid ? m.id + ":" + m.uid : m.row, m])).values()];
+                if (unique.length === 1) { result.set(group, { ...unique[0], referenceSource: "Equipped on page" }); continue; }
+                if (unique.length > 1) continue;
+            }
+            const items = state.equipment.filter(raw => groupOf(catalogEntry(raw.id)) === group);
+            if (items.length === 1) {
+                const raw = items[0];
+                const visible = state.mode === "inventory" && models.find(m => m.id === String(raw.id) && m.uid === uidOf(raw.uid));
+                if (visible && ["false", "0"].includes(visible.row.getAttribute("data-equipped"))) continue;
+                result.set(group, { id: String(raw.id), uid: uidOf(raw.uid), name: raw.name || catalogEntry(raw.id)?.name, group, referenceSource: "Equipped via API" });
+            }
+        }
+        return result;
     }
     function references(models) {
+        if (state.mode !== "inventory") return equippedReferences(models);
         const result = new Map();
         for (const group of GROUPS) {
             const pin = state.pins.get(group);
@@ -501,6 +717,37 @@
             }
         }
         return result;
+    }
+    function lowerReasons(model, ref) {
+        if (!state.opts.enabled || !ref || !model.group || sameItem(model, ref)) return [];
+        const item = catalogEntry(model.id), actual = statsFor(model), base = statsFor(ref), reasons = [];
+        const lower = (a, b) => compare(a, b).cls === "down";
+        // Unavailable or expired copy ratings never remove an item from view.
+        if (item?.type === "Weapon" && actual && base && !actual.stale && !base.stale) {
+            if (state.opts.hideLowerDamage && lower(actual.damage, base.damage)) reasons.push("damage");
+            if (model.group !== "Temporary" && state.opts.hideLowerAccuracy && lower(actual.accuracy, base.accuracy)) reasons.push("accuracy");
+        }
+        if (item?.type === "Armor") {
+            if (state.opts.hideLowerArmor && actual && base && !actual.stale && !base.stale && lower(actual.armor, base.armor)) reasons.push("armor rating");
+            const area = state.opts.coverageArea === "slot" ? SLOT_AREA[model.group] : state.opts.coverageArea;
+            if (state.opts.hideLowerCoverage && lower(coverage(item, area), coverage(catalogEntry(ref.id), area))) reasons.push("coverage");
+        }
+        return reasons;
+    }
+    function applyFilters(models) {
+        const refs = equippedReferences(models); let hidden = 0;
+        for (const model of models) {
+            const reasons = lowerReasons(model, refs.get(model.group));
+            if (reasons.length) { model.row.setAttribute("data-tw-ic-filtered", reasons.join(",")); hidden++; }
+            else if (model.row.hasAttribute("data-tw-ic-filtered")) model.row.removeAttribute("data-tw-ic-filtered");
+        }
+        state.hiddenCount = hidden;
+        if (state.resetFilters) state.resetFilters.hidden = !FILTER_KEYS.some(key => state.opts[key]);
+    }
+    function resetFilters() {
+        for (const key of FILTER_KEYS) state.opts[key] = false;
+        saveOptions(); schedule();
+        if (state.modal) openSettings();
     }
     function sameItem(a, b) { return Boolean(a && b && (a.uid && b.uid ? a.uid === b.uid && a.id === b.id : a.group === "Temporary" && b.group === "Temporary" && a.id === b.id)); }
     function compare(a, b) {
@@ -656,17 +903,17 @@
     }
     function currentModels() {
         if (!state.root) return [];
-        const candidates = Array.from(state.root.querySelectorAll(ROWS)).filter(n => !owned(n));
+        const candidates = Array.from(state.root.querySelectorAll(state.mode === "inventory" ? ROWS : SHOP_ROWS)).filter(n => !owned(n));
         state.rowCandidates = candidates.length;
-        const rows = new Set(candidates.map(inventoryRow).filter(row => row && state.root.contains(row)));
+        const rows = new Set(candidates.map(itemOwner).filter(row => row && state.root.contains(row)));
         // Only resolved item owners participate here. Nested action LIs have
         // already mapped to their parent item, so they cannot discard it.
         const groups = new Set();
         for (const row of rows) {
             for (let p = row.parentElement; p && p !== state.root; p = p.parentElement) if (rows.has(p)) groups.add(p);
         }
-        return [...rows].filter(row => !groups.has(row) && row.getClientRects().length > 0 && getComputedStyle(row).visibility !== "hidden")
-            .map(readRow).filter(Boolean);
+        return [...rows].filter(row => !groups.has(row) && rowVisible(row))
+            .map(state.mode === "inventory" ? readRow : readShoppingRow).filter(Boolean);
     }
     async function hydrate() {
         if (!state.key || !state.opts.enabled || state.blocked || Date.now() < state.blockedUntil) return;
@@ -680,7 +927,7 @@
             let models = currentModels();
             // Inventory is a fallback only for ambiguous data-id attributes, not
             // a way to assign duplicate copies by their display order or names.
-            const needsInventory = [...new Set(models.filter(m => !m.uid && m.weak && m.group !== "Temporary").map(m => inventoryCategory(m.group)))];
+            const needsInventory = state.mode === "inventory" ? [...new Set(models.filter(m => !m.uid && m.weak && m.group !== "Temporary").map(m => inventoryCategory(m.group)))] : [];
             for (const category of needsInventory) {
                 try { await loadInventory(category); }
                 catch (e) { log("Inventory fallback unavailable", { category, message: e.message }, "WARN"); if (state.blocked || epoch !== state.epoch) throw e; }
@@ -692,6 +939,7 @@
             const pending = [];
             for (const model of wanted) {
                 if (!model.uid || requested.has(model.uid)) continue;
+                if (model.shopping && statsFor(model) && !statsFor(model).stale) continue;
                 const record = state.details.get(model.uid);
                 if (fresh(record, TTL.detail) && record.id === model.id) continue;
                 if (Date.now() - (state.failures.get(model.uid) || 0) < 60000) continue;
@@ -737,8 +985,8 @@
         if (!state.key || !state.opts.enabled || state.hydrating || state.blocked || Date.now() < state.blockedUntil) return false;
         if (["Weapon", "Armor"].some(c => !fresh(state.catalogs.get(c), TTL.catalog) && Date.now() - (state.catalogAttempts.get(c) || 0) >= 60000)) return true;
         if ((state.equipmentWanted || !state.equipmentAt) && Date.now() - state.equipmentFailedAt >= 30000) return true;
-        if (models.some(m => !m.uid && m.weak && m.group && m.group !== "Temporary" && !fresh(state.inventories.get(inventoryCategory(m.group)), TTL.inventory) && Date.now() - (state.failures.get("inventory:" + inventoryCategory(m.group)) || 0) >= 60000)) return true;
-        return [...models, ...references(models).values()].some(m => m.uid && (!fresh(state.details.get(m.uid), TTL.detail) || state.details.get(m.uid).id !== m.id) && Date.now() - (state.failures.get(m.uid) || 0) >= 60000);
+        if (state.mode === "inventory" && models.some(m => !m.uid && m.weak && m.group && m.group !== "Temporary" && !fresh(state.inventories.get(inventoryCategory(m.group)), TTL.inventory) && Date.now() - (state.failures.get("inventory:" + inventoryCategory(m.group)) || 0) >= 60000)) return true;
+        return [...models, ...references(models).values()].some(m => m.uid && !(m.shopping && statsFor(m) && !statsFor(m).stale) && (!fresh(state.details.get(m.uid), TTL.detail) || state.details.get(m.uid).id !== m.id) && Date.now() - (state.failures.get(m.uid) || 0) >= 60000);
     }
 
     function applyTheme() {
@@ -751,6 +999,8 @@
         if (document.getElementById(P + "styles")) return;
         const node = el("style"); node.id = P + "styles"; node.setAttribute("data-tw-ic-owned", "style");
         node.textContent = `
+        [data-tw-ic-filtered]{display:none!important}
+        .${P}toolbar [hidden]{display:none!important}
         /* Both layouts stay within the resolved native inventory row. */
         .${P}annotated{height:auto!important;max-height:none!important;flex-wrap:wrap!important}
         .${P}inline-grow{height:auto!important;max-height:none!important}
@@ -832,7 +1082,8 @@
             const bar = el("div", null, P + "toolbar"); bar.id = P + "toolbar"; bar.setAttribute("data-tw-ic-owned", "toolbar");
             const text = el("div"); state.baselineText = el("span"); state.statusText = el("small"); text.append(state.baselineText, state.statusText);
             const gear = button("⚙", openSettings, P + "gear"); gear.title = "Inventory Compare settings"; gear.setAttribute("aria-label", "Open Inventory Compare settings");
-            bar.append(text, gear); state.toolbar = bar;
+            state.resetFilters = button("Reset filters", resetFilters); state.resetFilters.hidden = true;
+            bar.append(text, state.resetFilters, gear); state.toolbar = bar;
         }
         const bar = state.toolbar;
         if (state.root && state.root.parentElement) {
@@ -850,7 +1101,7 @@
     }
     function renderRow(model, ref) {
         const row = model.row;
-        const wraps = Array.from(row.querySelectorAll("." + P + "wrap")).filter(n => inventoryRow(n.parentElement) === row);
+        const wraps = Array.from(row.querySelectorAll("." + P + "wrap")).filter(n => itemOwner(n.parentElement) === row);
         let wrap = wraps.shift(); wraps.forEach(n => n.remove());
         const cat = catalogEntry(model.id);
         if ((!model.group && !(cat && cat.type === "Armor")) || !state.opts.enabled) { releaseRow(row, wrap); return; }
@@ -884,31 +1135,34 @@
             small.append(el("span", "RoF " + rate.min + (rate.min !== rate.max ? "-" + rate.max : "")), el("span", c.symbol, P + "arrow " + P + c.cls));
             small.title = c.text + "; unmodified rounds per turn. Tap for details."; chip.append(small);
         }
-        if (!actual || actual.stale || !ref) chip.append(el("small", !actual ? (model.uid ? "Stats pending" : "UID needed") : actual.stale ? "Cached stats" : "Choose reference", P + "muted"));
-        chip.title = model.name + (ref ? " vs " + ref.name : ": no reference yet") + ". Tap for details or choose a reference.";
+        if (!actual || actual.stale || !ref) chip.append(el("small", !actual ? (model.uid ? "Stats pending" : "UID needed") : actual.stale ? "Cached stats" : model.shopping ? "No equipped item in this slot" : "Choose reference", P + "muted"));
+        chip.title = model.name + (ref ? " vs " + ref.name : ": no reference yet") + (model.shopping ? ". Tap for comparison details." : ". Tap for details or choose a reference.");
         chip.setAttribute("aria-label", chip.title); wrap.append(chip);
     }
     function scanAndRender() {
         if (!state.alive || !document.body) return;
+        state.mode = pageMode();
+        if (!state.mode) { attachRoot(null); state.toolbar?.remove(); return; }
         styles(); attachRoot(findRoot()); ensureToolbar();
         const models = currentModels(); state.rows = models;
         const liveRows = new Set(models.map(m => m.row));
         if (state.root) for (const row of state.root.querySelectorAll("." + P + "annotated")) if (!liveRows.has(row)) releaseRow(row);
         const refs = references(models);
         const groups = [...new Set(models.map(m => m.group).filter(Boolean))];
-        const labels = groups.map(g => refs.has(g) ? (groups.length > 1 ? g + ": " : "") + refs.get(g).name : g + ": choose reference");
+        const labels = groups.map(g => refs.has(g) ? (groups.length > 1 ? g + ": " : "") + refs.get(g).name : g + (state.mode === "inventory" ? ": choose reference" : ": nothing equipped"));
         const title = !state.opts.enabled ? "Inventory Compare paused" : labels.length ? "Compare with: " + labels.join(" | ") : "Inventory Compare";
         if (state.baselineText.textContent !== title) state.baselineText.textContent = title;
         const eligible = models.filter(m => m.group || (catalogEntry(m.id) && catalogEntry(m.id).type === "Armor"));
         state.scanned = eligible.length; state.loaded = eligible.filter(m => statsFor(m)).length;
-        const info = !state.key ? "Tap ⚙ to add a minimal-access Torn API key" : state.blocked || state.progress || state.notice ||
-            state.loaded + "/" + state.scanned + " items have stats · ↑ higher · ↓ lower · = equal · tap stats for details";
-        if (state.statusText.textContent !== info) state.statusText.textContent = info;
         for (const m of models) renderRow(m, refs.get(m.group));
+        applyFilters(models);
+        const info = !state.key ? "Tap ⚙ to add a minimal-access Torn API key" : state.blocked || state.progress || state.notice ||
+            state.loaded + "/" + state.scanned + " items have stats · " + state.hiddenCount + " hidden · ↑ higher · ↓ lower · = equal · tap stats for details";
+        if (state.statusText.textContent !== info) state.statusText.textContent = info;
         const resolution = JSON.stringify([state.rowCandidates, models.length, models.filter(m => m.uid).length]);
         if (resolution !== state.lastRowResolution) {
             state.lastRowResolution = resolution;
-            log("Inventory rows resolved", { identityNodes: state.rowCandidates, itemRows: models.length, rowsWithUid: models.filter(m => m.uid).length });
+            log("Inventory rows resolved", { surface: state.mode, identityNodes: state.rowCandidates, itemRows: models.length, rowsWithUid: models.filter(m => m.uid).length });
         }
         const refSignature = JSON.stringify([title, models.length, [...refs].map(([g, r]) => [g, r.id, r.uid, r.referenceSource])]);
         if (refSignature !== state.lastReferences) {
@@ -938,7 +1192,7 @@
             const chip = widgets[0], rowRect = model.row.getBoundingClientRect(), r = chip?.getBoundingClientRect();
             const category = model.row.closest(NATIVE_LISTS);
             const nativeOwner = model.row.closest(NATIVE_ROWS);
-            const expectedOwner = inventoryRow(model.row);
+            const expectedOwner = itemOwner(model.row);
             const misplaced = Boolean(chip && (expectedOwner !== model.row ||
                 (nativeOwner && nativeOwner !== model.row && !hasItemTitle(model.row)) ||
                 chip.parentElement.parentElement !== rowHost(model.row, model)));
@@ -1039,7 +1293,7 @@
     }
     function openSettings() {
         const panel = modal("Inventory Compare · " + VERSION);
-        panel.append(el("p", "Compare individual item ratings against the equipped item in each category or armor slot. Tap any row's comparison to choose another reference.", P + "muted"));
+        panel.append(el("p", "Compare individual item ratings in inventory, the item market and bazaars. Market and bazaar listings always compare with your equipped weapon category or armor slot. Inventory also supports chosen references.", P + "muted"));
         const credentials = el("div", null, P + "stack"); credentials.append(el("h3", "Torn API key"));
         const key = el("input"); key.type = "password"; key.maxLength = 16; key.autocomplete = "off"; key.spellcheck = false; key.setAttribute("aria-label", "16-character Torn API key");
         key.placeholder = state.key ? "Key saved. Enter a new key to replace it." : "16-character minimal-access key";
@@ -1071,9 +1325,16 @@
         }
         const refreshActions = el("div", null, P + "actions"); refreshActions.append(button("Refresh visible stats", () => { void refresh(); }), button("Refresh reference data", () => { void refresh(true); }), button("Use equipped references", () => { state.opts.referenceMode = "equipped"; saveOptions(); clearReferences(); openSettings(); }));
         settings.append(refreshActions); panel.append(settings);
+        const filters = el("div", null, P + "stack"); filters.append(el("h3", "Hide items below equipped gear"));
+        settingCheck(filters, "hideLowerDamage", "Hide lower damage");
+        settingCheck(filters, "hideLowerAccuracy", "Hide lower accuracy");
+        settingCheck(filters, "hideLowerArmor", "Hide lower armor rating");
+        settingCheck(filters, "hideLowerCoverage", "Hide lower armor coverage");
+        filters.append(el("p", "These four filters apply in inventory, item market and bazaars. An item is hidden when any checked stat is lower than the matching equipped item. Equal or unavailable comparisons stay visible. Weapon filters do not affect armor, and armor filters do not affect weapons. Coverage uses the selected body area. Filters always use equipped gear, including when inventory comparisons use a chosen item.", P + "muted"), button("Reset filters", resetFilters));
+        panel.append(filters);
         panel.append(el("p", "D = intrinsic damage rating, not predicted HP damage. A = accuracy. AR = armor. C(area) = coverage of that body area. ↑ higher, ↓ lower, = equal, ? unavailable. RoF is the unmodified rounds-per-turn range, not attack speed; ↕ means mixed bounds. Player perks, ammo, weapon mods and combat circumstances can change outcomes.", P + "callout"));
         panel.append(el("p", "Inventory API lists can be an hour old. Individual copies are matched only by UID. Missing UIDs are never assigned by name or row order. Expand an item's native information if its UID is unavailable, then refresh. Pins last for this page session.", P + "muted"));
-        panel.append(el("p", "Inline comparisons sit beside the item name and wrap within its name area when needed. Choose the previous layout to put comparisons below each row. Arrow and effect icon sizes can be adjusted independently.", P + "muted"));
+        panel.append(el("p", "Inventory comparisons sit beside the item name and wrap within its name area when needed. Choose the previous layout to put them below each inventory row. Market and bazaar comparisons stay within each listing. Arrow and effect icon sizes can be adjusted independently.", P + "muted"));
         panel.append(el("h3", "Weapon effect icons"));
         panel.append(el("p", "🔥 Burn · ⚡ Shock · ☠️ Poisoned · 🩸 Bleed / Laceration · ❄️ Freeze · 😵‍💫 Stun. Icons identify effects a weapon can apply; they do not mean an effect is guaranteed to trigger. Tap the comparison to see its effect labels and reported bonuses.", P + "muted"));
         panel.append(el("h3", "Temporary effect legend"));
@@ -1094,7 +1355,7 @@
         const item = catalogEntry(model.id); const actual = statsFor(model); const base = ref && statsFor(ref);
         const panel = modal(model.name);
         panel.append(el("p", (model.uid ? "UID " + model.uid : "No unique UID exposed in this row") + " · " + (model.group || "unknown slot"), P + "muted"));
-        panel.append(el("p", ref ? "Compared with " + ref.name + (ref.uid ? " [" + ref.uid + "]" : "") + " · " + ref.referenceSource : "No reference is available in this slot. Choose an inventory item below.", P + "callout"));
+        panel.append(el("p", ref ? "Compared with " + ref.name + (ref.uid ? " [" + ref.uid + "]" : "") + " · " + ref.referenceSource : model.shopping ? "No equipped reference is available in this category or armor slot." : "No reference is available in this slot. Choose an inventory item below.", P + "callout"));
         const t = el("table", null, P + "table"); tableRow(t, ["Rating", "This item", "Reference", "Change"], true);
         for (const [key, name] of model.group === "Temporary" ? [["damage", "Damage rating"]] : item && item.type === "Armor" ? [["armor", "Armor rating"]] : [["damage", "Damage rating"], ["accuracy", "Accuracy"]]) {
             const a = actual && actual[key], b = base && base[key]; const c = compare(a, b); tableRow(t, [name, fmt(a), fmt(b), c.symbol + (c.delta !== undefined ? " " + (c.delta > 0 ? "+" : "") + fmt(c.delta) : "")]);
@@ -1131,10 +1392,12 @@
         }
         const actions = el("div", null, P + "actions");
         const choose = button("Compare against this item", () => setReference(model)); choose.disabled = !model.group || (!model.uid && model.group !== "Temporary");
-        actions.append(choose, button("Use equipped references", () => { state.opts.referenceMode = "equipped"; saveOptions(); clearReferences(); closeModal(); }), button("Settings", openSettings)); panel.append(actions);
+        if (!model.shopping) actions.append(choose, button("Use equipped references", () => { state.opts.referenceMode = "equipped"; saveOptions(); clearReferences(); closeModal(); }));
+        actions.append(button("Settings", openSettings)); panel.append(actions);
     }
 
     function nativeClick(event) {
+        if (state.mode !== "inventory") return;
         if (owned(event.target) || !(event.target instanceof Element) || !state.root || !state.root.contains(event.target)) return;
         const row = inventoryRow(event.target);
         if (row && state.opts.referenceMode === "selected" && !event.target.closest('a,button,input,select,label,[role="button"],.option,.option-wrap')) {
@@ -1144,6 +1407,11 @@
         if (action) { state.equipmentWanted = true; state.equipmentFailedAt = 0; state.pins.clear(); schedule(); }
     }
     async function boot() {
+        if (!document.documentElement) await new Promise(resolve => {
+            const observer = new MutationObserver(() => { if (document.documentElement) { observer.disconnect(); resolve(); } });
+            observer.observe(document, { childList: true });
+        });
+        if (!marker.isConnected) (document.head || document.documentElement).appendChild(marker);
         const [opts, key, cached] = await Promise.all([readStore("options", {}), readStore("api-key", ""), readStore("cache", null)]);
         state.opts = sanitizeOptions(opts); state.key = typeof key === "string" && /^[A-Za-z0-9]{16}$/.test(key) ? key : "";
         if (cached && cached.schema === 1) {
@@ -1155,7 +1423,8 @@
         document.addEventListener("click", nativeClick, true);
         state.discovery = new MutationObserver(records => {
             if (!state.root || !state.root.isConnected || !state.toolbar || !state.toolbar.isConnected) { schedule(); return; }
-            if (records.some(m => !owned(m.target) && [...m.addedNodes, ...m.removedNodes].some(n => n.nodeType === 1 && !owned(n) && (n.matches(".items-wrap,#all-items") || n.querySelector(".items-wrap,#all-items"))))) schedule();
+            const roots = Object.values(ROOTS).join(",");
+            if (records.some(m => !owned(m.target) && [...m.addedNodes, ...m.removedNodes].some(n => n.nodeType === 1 && !owned(n) && (n.matches(roots) || n.querySelector(roots))))) schedule();
         });
         state.discovery.observe(document.documentElement, { childList: true, subtree: true });
         window.addEventListener("pageshow", schedule);
@@ -1167,7 +1436,7 @@
             const register = typeof GM_registerMenuCommand === "function" ? GM_registerMenuCommand : typeof GM !== "undefined" && GM.registerMenuCommand ? GM.registerMenuCommand.bind(GM) : null;
             if (register) register("Inventory Compare settings", openSettings);
         } catch (_) { log("Userscript menu unavailable", {}, "DEBUG"); }
-        log("Started", { version: VERSION, cachedItems: state.details.size, keyPresent: Boolean(state.key) }); schedule();
+        log("Started", { version: VERSION, surface: state.mode, cachedItems: state.details.size, keyPresent: Boolean(state.key), listingObserver: state.observedFetch }); schedule();
     }
 
     // Supplied SupportModule and debugger are bundled below, inside this IIFE.
@@ -3268,5 +3537,6 @@ function initializeModularDebugger(scriptNamespace) {
 
 // END SUPPLIED DEBUGGER MODULE
 
+    installListingObserver();
     void boot().catch(error => MyDebug.log({ event: "Startup failed", message: error.message }, "ERROR"));
-})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.0.6" } });
+})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.1.0" } });
