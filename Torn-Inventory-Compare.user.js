@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn-Inventory-Compare
 // @namespace    https://github.com/ShavedW00kie/
-// @version      1.2.0
+// @version      1.2.1
 // @description  Compare weapons and armor in inventory, markets, bazaars and overseas shops. Includes compact filters, market slider minimums, effects, coverage and diagnostics.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -60,7 +60,7 @@
     }
     if (!pageMode()) return;
     const MyDebug = initializeModularDebugger(GM_info.script.name);
-    const VERSION = "1.2.0";
+    const VERSION = "1.2.1";
     const P = "tw-ic-";
     if (document.getElementById(P + "active")) return;
     const marker = document.createElement("meta");
@@ -187,7 +187,7 @@
         rowCandidates: 0, lastRowResolution: "", lastLayout: "", layoutFrame: 0,
         mode: pageMode(), hiddenCount: 0, resetFilters: null, tempToggle: null, listingData: new Map(), listingIds: new Map(), observedFetch: false,
         filterSlots: new Set(), compactLists: new Set(), sliderStates: new Map(), syncingSliders: false,
-        sliderStatus: "", lastSliderStatus: "", referenceSerial: 0
+        sliderStatus: "", lastSliderStatus: "", referenceSerial: 0, bazaarLayoutNodes: new Set()
     };
 
     const number = value => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
@@ -761,7 +761,49 @@
         }
         const listingStats = records[0] || null;
         if (listingStats?.uid) rememberListing(listingStats, listingScope());
-        return { id, uid, weak: "", name: catalog?.name || "Item " + id, group: groupOf(catalog), row, equipped: false, listingStats, shopping: true, abroad: state.mode === "abroad" };
+        const cell = state.mode === "bazaar" ? bazaarCell(row) : null;
+        const bazaarPositioned = Boolean(cell && bazaarLocked(row));
+        return { id, uid, weak: "", name: catalog?.name || "Item " + id, group: groupOf(catalog), row, equipped: false, listingStats, shopping: true, abroad: state.mode === "abroad",
+            bazaarPositioned, bazaarCompact: Boolean(cell && (bazaarPositioned || cell.getBoundingClientRect().width < 120)) };
+    }
+    function bazaarCell(row) {
+        const description = row.querySelector('[class*="itemDescription__"]');
+        if (!description) return null;
+        return description.querySelector(':scope > [class*="description__"]') || description;
+    }
+    function bazaarGroup(row) { return row.closest('[data-testid="bazaar-items-row"],[class*="row__"]'); }
+    function bazaarLocked(row) {
+        const group = bazaarGroup(row);
+        return Boolean(group && ["absolute", "fixed"].includes(getComputedStyle(group).position));
+    }
+    function syncBazaarLayout(models) {
+        const wanted = new Map();
+        const mark = (node, role) => {
+            if (!node || node === state.root) return;
+            if (!wanted.has(node)) wanted.set(node, new Set());
+            wanted.get(node).add(role);
+        };
+        if (state.mode === "bazaar" && state.opts.enabled) for (const model of models) {
+            const row = model.row, cell = bazaarCell(row);
+            if (!cell || !row.querySelector("." + P + "wrap")) continue;
+            mark(row, "card");
+            if (model.bazaarCompact) mark(row, "compact");
+            for (let node = cell; node && node !== row; node = node.parentElement) mark(node, "cell");
+            // Normal rows may grow with their contents. Positioned virtual
+            // rows keep Torn's offsets and scroll geometry; use a compact
+            // single-line comparison in their existing description instead.
+            if (!model.bazaarPositioned) {
+                const list = row.parentElement, group = bazaarGroup(row);
+                if (list?.matches('[data-testid="row-items"],[class*="rowItems__"]')) mark(list, "flow");
+                if (group) mark(group, "flow");
+            }
+        }
+        for (const node of state.bazaarLayoutNodes) if (!wanted.has(node)) node.removeAttribute("data-tw-ic-bazaar-layout");
+        for (const [node, roles] of wanted) {
+            const value = [...roles].join(" ");
+            if (node.getAttribute("data-tw-ic-bazaar-layout") !== value) node.setAttribute("data-tw-ic-bazaar-layout", value);
+        }
+        state.bazaarLayoutNodes = new Set(wanted.keys());
     }
     function nameHost(row) {
         // Mount only inside this item's name area. The v1.0.5 ownership check
@@ -772,6 +814,7 @@
     }
     function rowHost(row, model) {
         if (model.abroad) return row.querySelector('[class*="itemName__"],[data-tt-content-type="name"]') || row.querySelector('[class*="row__"]') || row;
+        if (state.mode === "bazaar") { const cell = bazaarCell(row); if (cell) return cell; }
         if (model.shopping) return row;
         if (state.opts.layout === "inline") {
             const host = nameHost(row);
@@ -809,7 +852,7 @@
         if (!row.classList.contains(P + "annotated")) row.classList.add(P + "annotated");
         // Attribute is a layout hook, not an ownership marker: native row
         // mutations must remain visible to the inventory observer.
-        const inline = state.opts.layout === "inline" && host !== row && host === nameHost(row);
+        const inline = state.mode === "inventory" && state.opts.layout === "inline" && host !== row && host === nameHost(row);
         const mode = inline ? "inline" : host === row ? "footer" : "cell";
         inlineClasses(row, inline || model.abroad ? host : null);
         if (row.getAttribute("data-tw-ic-mount") !== mode) row.setAttribute("data-tw-ic-mount", mode);
@@ -820,6 +863,7 @@
         else row.querySelectorAll("." + P + "wrap").forEach(n => n.remove());
         if (row.classList.contains(P + "annotated")) row.classList.remove(P + "annotated");
         if (row.hasAttribute("data-tw-ic-mount")) row.removeAttribute("data-tw-ic-mount");
+        row.removeAttribute("data-tw-ic-bazaar-layout");
         row.removeAttribute("data-tw-ic-filtered");
         inlineClasses(row, null);
         state.rowModels.delete(row);
@@ -833,6 +877,7 @@
     function attachRoot(root) {
         if (state.root === root) return;
         if (state.inventoryObserver) state.inventoryObserver.disconnect();
+        syncBazaarLayout([]);
         clearFilterLayout();
         restoreMarketSliders();
         if (state.root) for (const row of state.root.querySelectorAll("." + P + "annotated,[data-tw-ic-filtered]")) releaseRow(row);
@@ -1338,6 +1383,21 @@
         node.textContent = `
         [data-tw-ic-filtered],[data-tw-ic-filter-slot]{display:none!important}
         [data-tw-ic-compact]>[data-tw-ic-grid-slot]{clear:none!important;grid-column:auto!important;grid-row:auto!important;height:auto!important;max-height:none!important}
+        [data-tw-ic-bazaar-layout~="cell"],[data-tw-ic-bazaar-layout~="flow"]{height:auto!important;max-height:none!important;min-width:0!important;overflow:visible!important}
+        .${P}annotated[data-tw-ic-bazaar-layout~="card"]>[class*="itemDescription__"]{padding-left:2px!important;padding-right:0!important}
+        .${P}annotated[data-tw-ic-bazaar-layout~="card"] .${P}wrap{padding:1px 0!important}
+        .${P}annotated[data-tw-ic-bazaar-layout~="card"] .${P}wrap .${P}chip{flex-direction:row!important;flex-wrap:wrap!important;align-items:center!important;justify-content:flex-start!important;column-gap:6px!important;row-gap:0!important;overflow-x:auto!important;overflow-y:hidden!important}
+        .${P}annotated[data-tw-ic-bazaar-layout~="card"] .${P}wrap .${P}metric{flex-shrink:0!important;max-width:none!important}
+        .${P}annotated[data-tw-ic-bazaar-layout~="card"] .${P}wrap .${P}metric>span:first-child{flex-shrink:0!important}
+        [data-tw-ic-bazaar-layout~="compact"]{padding-top:0!important;padding-bottom:0!important}
+        [data-tw-ic-bazaar-layout~="compact"] [data-tw-ic-bazaar-layout~="cell"]{padding-top:0!important;padding-bottom:0!important}
+        .${P}annotated[data-tw-ic-bazaar-layout~="compact"][data-tw-ic-mount] .${P}wrap{padding:0!important}
+        .${P}annotated[data-tw-ic-bazaar-layout~="compact"] .${P}wrap .${P}chip{flex-wrap:nowrap!important;min-height:0!important;width:max-content!important;max-width:100%!important;padding:0!important;overflow-x:auto!important;overflow-y:hidden!important;scrollbar-width:none}
+        [data-tw-ic-bazaar-layout~="compact"] .${P}chip::-webkit-scrollbar{display:none}
+        .${P}annotated[data-tw-ic-bazaar-layout~="compact"] .${P}wrap .${P}line,.${P}annotated[data-tw-ic-bazaar-layout~="compact"] .${P}wrap .${P}rof{flex-shrink:0!important;max-width:none!important;flex-wrap:nowrap!important}
+        .${P}annotated[data-tw-ic-bazaar-layout~="compact"] .${P}wrap .${P}line{column-gap:4px!important}
+        .${P}annotated[data-tw-ic-bazaar-layout~="compact"] .${P}wrap .${P}metric{gap:1px!important}
+        .${P}annotated[data-tw-ic-bazaar-layout~="compact"] .${P}wrap .${P}effect{line-height:1!important}
         .${P}toolbar [hidden]{display:none!important}
         /* Both layouts stay within the resolved native inventory row. */
         .${P}annotated{height:auto!important;max-height:none!important;flex-wrap:wrap!important}
@@ -1431,11 +1491,11 @@
             if (bar.nextElementSibling !== state.root) state.root.before(bar);
         } else if (!bar.isConnected) { bar.classList.add(P + "fallback"); document.body.appendChild(bar); }
     }
-    function metric(label, value, baseline, percent = false) {
+    function metric(label, value, baseline, percent = false, compact = false) {
         const node = el("span", null, P + "metric"); const c = compare(value, baseline);
-        node.append(el("span", label + (state.opts.showValues ? " " + ratingText(value) + (percent && number(value) !== null ? "%" : "") : "")));
+        node.append(el("span", label + (state.opts.showValues && !compact ? " " + ratingText(value) + (percent && number(value) !== null ? "%" : "") : "")));
         const arrow = el("span", c.symbol, P + "arrow " + P + c.cls); arrow.setAttribute("aria-hidden", "true"); node.append(arrow);
-        if (state.opts.showDeltas && c.delta !== undefined && c.delta !== 0) node.append(el("small", (c.delta > 0 ? "+" : "") + fmt(c.delta), P + "delta"));
+        if (state.opts.showDeltas && !compact && c.delta !== undefined && c.delta !== 0) node.append(el("small", (c.delta > 0 ? "+" : "") + fmt(c.delta), P + "delta"));
         node.setAttribute("aria-label", label + " " + ratingText(value) + (percent ? " percent" : "") + ", " + c.text + (number(baseline) !== null ? " than " + fmt(baseline) : ""));
         return node;
     }
@@ -1447,7 +1507,7 @@
         if ((!model.group && !(cat && cat.type === "Armor")) || !state.opts.enabled) { releaseRow(row, wrap); return; }
         const actual = statsFor(model); const base = ref && statsFor(ref);
         const area = state.opts.coverageArea === "slot" ? SLOT_AREA[model.group] : state.opts.coverageArea;
-        const sig = JSON.stringify([model.id, model.uid, actual, ref && [ref.id, ref.uid], base, state.opts, cat && cat.details, model.equipped]);
+        const sig = JSON.stringify([model.id, model.uid, actual, ref && [ref.id, ref.uid], base, state.opts, cat && cat.details, model.equipped, model.bazaarCompact]);
         if (!wrap) {
             wrap = el("span", null, P + "wrap"); wrap.setAttribute("data-tw-ic-owned", "row");
         }
@@ -1459,11 +1519,11 @@
         if (model.group === "Temporary") {
             line.append(metric("D", actual && actual.damage, base && base.damage));
         } else if (cat && cat.type === "Armor") {
-            line.append(metric("AR", actual && actual.armor, base && base.armor));
+            line.append(metric("AR", actual && actual.armor, base && base.armor, false, model.bazaarCompact));
             if (model.group) line.append(metric("C(" + (AREA_SHORT[area] || "?") + ")", coverage(cat, area), ref ? coverage(catalogEntry(ref.id), area) : null, true));
             else line.append(el("small", "Choose armor slot", P + "muted"));
         } else {
-            line.append(metric("D", actual && actual.damage, base && base.damage), metric("A", actual && actual.accuracy, base && base.accuracy));
+            line.append(metric("D", actual && actual.damage, base && base.damage, false, model.bazaarCompact), metric("A", actual && actual.accuracy, base && base.accuracy, false, model.bazaarCompact));
         }
         if (state.opts.showEffects) for (const value of weaponEffects(cat, actual)) line.append(effectIcon(value));
         if (baseline) { const b = el("span", "◎", P + "equal"); b.setAttribute("aria-label", "Reference item"); line.append(b); }
@@ -1498,6 +1558,7 @@
         const eligible = models.filter(m => m.group || (catalogEntry(m.id) && catalogEntry(m.id).type === "Armor"));
         state.scanned = eligible.length; state.loaded = eligible.filter(m => statsFor(m)).length;
         for (const m of models) renderRow(m, refs.get(m.group));
+        syncBazaarLayout(models);
         applyFilters(models);
         const info = !state.key ? "Tap ⚙ to add a minimal-access Torn API key" : state.blocked || state.progress || state.notice ||
             state.loaded + "/" + state.scanned + " items have stats · " + state.hiddenCount + " hidden · ↑ higher · ↓ lower · = equal · tap stats for details" + (state.sliderStatus ? " · " + state.sliderStatus : "");
@@ -1517,6 +1578,20 @@
         if (!state.key && !state.autoOpened) { state.autoOpened = true; openSettings(); }
     }
 
+    function clippingAncestors(node) {
+        if (!node) return [];
+        const r = node.getBoundingClientRect(), result = [];
+        for (let parent = node.parentElement, depth = 0; parent && depth < 16; parent = parent.parentElement, depth++) {
+            const style = getComputedStyle(parent), box = parent.getBoundingClientRect();
+            const x = /^(?:hidden|clip)$/.test(style.overflowX) && (r.left < box.left - 2 || r.right > box.right + 2);
+            const y = /^(?:hidden|clip)$/.test(style.overflowY) && (r.top < box.top - 2 || r.bottom > box.bottom + 2);
+            if (x || y) result.push({ tag: parent.tagName.toLowerCase(), classes: clean(parent.className).slice(0, 180),
+                overflowX: style.overflowX, overflowY: style.overflowY, position: style.position,
+                width: Math.round(box.width), height: Math.round(box.height), horizontal: x, vertical: y });
+            if (parent === state.root) break;
+        }
+        return result;
+    }
     function layoutSnapshot() {
         const box = node => {
             if (!node) return null;
@@ -1526,13 +1601,15 @@
         const rows = state.rows.filter(m => m.row.isConnected && m.row.getClientRects().length);
         const inventoryRect = state.root?.getBoundingClientRect();
         const horizontalOutside = (r, boundary) => Boolean(r && boundary && (r.left < boundary.left - 2 || r.right > boundary.right + 2));
-        const samples = []; let outside = 0, outsideInventory = 0, duplicates = 0, missing = 0, wrongOwner = 0, squeezed = 0;
+        const samples = []; let outside = 0, outsideInventory = 0, duplicates = 0, missing = 0, wrongOwner = 0, squeezed = 0, clipped = 0;
         for (const model of rows) {
             const widgets = Array.from(model.row.querySelectorAll("." + P + "chip"));
             const eligible = model.group || catalogEntry(model.id)?.type === "Armor";
             if (!widgets.length && eligible && state.opts.enabled) missing++;
             if (widgets.length > 1) duplicates++;
             const chip = widgets[0], rowRect = model.row.getBoundingClientRect(), r = chip?.getBoundingClientRect();
+            const clipAncestors = clippingAncestors(chip);
+            if (clipAncestors.length) clipped++;
             const category = model.row.closest(NATIVE_LISTS);
             const nativeOwner = model.row.closest(NATIVE_ROWS);
             const expectedOwner = itemOwner(model.row);
@@ -1547,10 +1624,12 @@
             if (beyondInventory) outsideInventory++;
             if (misplaced) wrongOwner++;
             if (narrow) squeezed++;
-            if (samples.length < 3 || ((bad || misplaced || narrow) && samples.length < 8)) samples.push({
+            if (samples.length < 3 || ((bad || misplaced || narrow || clipAncestors.length) && samples.length < 8)) samples.push({
                 rowTag: model.row.tagName.toLowerCase(), itemId: model.id, hasUid: Boolean(model.uid),
                 mountTag: chip?.parentElement.parentElement.tagName.toLowerCase() || null,
                 rowDisplay: getComputedStyle(model.row).display, rowBox: box(model.row), widgetBox: box(chip),
+                mountClass: clean(chip?.parentElement.parentElement.className), clipAncestors,
+                bazaarFrameBox: state.mode === "bazaar" ? box(bazaarGroup(model.row)) : undefined, bazaarCompact: Boolean(model.bazaarCompact),
                 categoryBox: box(category), nativeOwnerBox: box(nativeOwner), widgets: widgets.length,
                 outside: bad, outsideInventory: beyondInventory, wrongOwner: misplaced, squeezed: narrow
             });
@@ -1558,19 +1637,19 @@
         return { version: VERSION, surface: state.mode, identityNodes: state.rowCandidates, itemRows: rows.length,
             marketTiles: state.root?.querySelectorAll(MARKET_TILES).length || 0,
             collapsedSlots: state.filterSlots.size, nativeSliderControls: marketSliderControls().length, sliderMinimums: state.sliderStatus,
-            inventoryBox: box(state.root), outside, outsideInventory, wrongOwner, squeezed, duplicates, missing, samples };
+            inventoryBox: box(state.root), outside, outsideInventory, wrongOwner, squeezed, duplicates, missing, clipped, samples };
     }
     function checkLayoutSoon() {
         if (state.layoutFrame) return;
         state.layoutFrame = requestAnimationFrame(() => {
             state.layoutFrame = 0;
             const report = layoutSnapshot();
-            const sig = JSON.stringify([report.itemRows, report.outside, report.outsideInventory, report.wrongOwner, report.squeezed, report.duplicates, report.missing]);
+            const sig = JSON.stringify([report.itemRows, report.outside, report.outsideInventory, report.wrongOwner, report.squeezed, report.duplicates, report.missing, report.clipped]);
             if (sig === state.lastLayout) return;
             state.lastLayout = sig;
             log("Layout check", { rows: report.itemRows, outside: report.outside, outsideInventory: report.outsideInventory,
-                wrongOwner: report.wrongOwner, squeezed: report.squeezed, duplicates: report.duplicates, missing: report.missing },
-                report.outside || report.wrongOwner || report.squeezed || report.duplicates || report.missing ? "WARN" : "INFO");
+                wrongOwner: report.wrongOwner, squeezed: report.squeezed, duplicates: report.duplicates, missing: report.missing, clipped: report.clipped },
+                report.outside || report.wrongOwner || report.squeezed || report.duplicates || report.missing || report.clipped ? "WARN" : "INFO");
         });
     }
 
@@ -3895,4 +3974,4 @@ function initializeModularDebugger(scriptNamespace) {
 
     installListingObserver();
     void boot().catch(error => MyDebug.log({ event: "Startup failed", message: error.message }, "ERROR"));
-})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.2.0" } });
+})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.2.1" } });
