@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn-Inventory-Compare
 // @namespace    https://github.com/ShavedW00kie/
-// @version      1.1.1
-// @description  Compare actual weapon and armor stats in inventory, item market and bazaars against matching equipped gear. Includes lower-stat filters, effects, coverage and diagnostics.
+// @version      1.2.0
+// @description  Compare weapons and armor in inventory, markets, bazaars and overseas shops. Includes compact filters, market slider minimums, effects, coverage and diagnostics.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
 // @homepageURL  https://github.com/ShavedW00kie/
@@ -55,11 +55,12 @@
         if (path === "/item.php") return "inventory";
         if (path === "/bazaar.php") return "bazaar";
         if (path === "/imarket.php" || (path === "/page.php" && /^(?:itemmarket|imarket)$/i.test(new URLSearchParams(location.search).get("sid") || ""))) return "market";
+        if (path === "/page.php" && /^travel$/i.test(new URLSearchParams(location.search).get("sid") || "")) return "abroad";
         return "";
     }
     if (!pageMode()) return;
     const MyDebug = initializeModularDebugger(GM_info.script.name);
-    const VERSION = "1.1.1";
+    const VERSION = "1.2.0";
     const P = "tw-ic-";
     if (document.getElementById(P + "active")) return;
     const marker = document.createElement("meta");
@@ -90,9 +91,89 @@
     const MARKET_TILES = '[class*="itemTile__"]';
     const SHOP_NATIVE_ROWS = MARKET_TILES + ',[class*="itemList__"] > li,[class*="sellerList__"] > li,[class*="sellerRow__"],[class*="rowItems__"] > [class*="item__"],.items-list > li,.market-listing,.bazaar-item';
     const SHOP_ROWS = SHOP_NATIVE_ROWS + ',[data-listing-id],[data-bazaar-id]';
+    const ABROAD_ROWS = '[class*="stockTableWrapper__"] > li';
     const ROOTS = { inventory: "div.items-wrap,.items-wrap,#all-items", market: "#item-market-root,#itemmarket,.item-market-wrap",
-        bazaar: '#bazaarRoot,#bazaarroot,#bazaar-root,.bazaar-main-wrap,[class*="itemsContainner__"]' };
+        bazaar: '#bazaarRoot,#bazaarroot,#bazaar-root,.bazaar-main-wrap,[class*="itemsContainner__"]',
+        abroad: '[class*="shops__"]' };
     const FILTER_KEYS = ["hideLowerDamage", "hideLowerAccuracy", "hideLowerArmor", "hideLowerCoverage"];
+    // Ordinary overseas shop ranges, checked against official Torn Wiki tables
+    // on 2026-10-18: https://wiki.torn.com/wiki/Weapon and /wiki/Armor.
+    // Catalog metadata only, never assigned as the rolled stats of a copy.
+    const ABROAD_RANGES = Object.freeze({
+        "9mm uzi": {"damage":[65,70],"accuracy":[43,48]},
+        "ak-47": {"damage":[56,61],"accuracy":[52,57]},
+        "armalite m-15a4": {"damage":[68,73],"accuracy":[57,62]},
+        "bushmaster carbon 15": {"damage":[50,55],"accuracy":[57,62]},
+        "enfield sa-80": {"damage":[63,68],"accuracy":[55,60]},
+        "gold plated ak-47": {"damage":[75,80],"accuracy":[62,67]},
+        "heckler & koch sl8": {"damage":[60,65],"accuracy":[46,51]},
+        "ithaca 37": {"damage":[49,54],"accuracy":[62,67]},
+        "jackhammer": {"damage":[69,74],"accuracy":[52,57]},
+        "m249 saw": {"damage":[67,72],"accuracy":[41,46]},
+        "mag 7": {"damage":[56,61],"accuracy":[62,67]},
+        "minigun": {"damage":[72,77],"accuracy":[28,33]},
+        "sig 550": {"damage":[62,67],"accuracy":[50,55]},
+        "sig 552": {"damage":[69,74],"accuracy":[50,55]},
+        "sks carbine": {"damage":[46,51],"accuracy":[47,52]},
+        "tavor tar-21": {"damage":[65,70],"accuracy":[52,57]},
+        "vektor cr-21": {"damage":[50,55],"accuracy":[48,53]},
+        "type 98 anti tank": {"damage":[78,83],"accuracy":[25,30]},
+        "blowgun": {"damage":[15,20],"accuracy":[39,44]},
+        "bt mp9": {"damage":[61,66],"accuracy":[55,60]},
+        "cobra derringer": {"damage":[61,66],"accuracy":[53,58]},
+        "crossbow": {"damage":[35,40],"accuracy":[63,68]},
+        "desert eagle": {"damage":[59,64],"accuracy":[36,41]},
+        "flamethrower": {"damage":[67,72],"accuracy":[39,44]},
+        "flare gun": {"damage":[18,23],"accuracy":[22,27]},
+        "harpoon": {"damage":[47,52],"accuracy":[63,68]},
+        "lorcin 380": {"damage":[27,32],"accuracy":[41,46]},
+        "pink mac-10": {"damage":[74,79],"accuracy":[45,50]},
+        "qsz-92": {"damage":[62,67],"accuracy":[53,58]},
+        "springfield 1911": {"damage":[33,38],"accuracy":[57,62]},
+        "taser": {"damage":[1,5],"accuracy":[54,59]},
+        "taurus": {"damage":[30,35],"accuracy":[57,62]},
+        "axe": {"damage":[34,39],"accuracy":[52,57]},
+        "bo staff": {"damage":[13,18],"accuracy":[55,60]},
+        "chain whip": {"damage":[31,36],"accuracy":[52,57]},
+        "claymore sword": {"damage":[57,62],"accuracy":[49,54]},
+        "cricket bat": {"damage":[18,23],"accuracy":[42,47]},
+        "diamond bladed knife": {"damage":[60,65],"accuracy":[62,67]},
+        "flail": {"damage":[71,76],"accuracy":[28,33]},
+        "frying pan": {"damage":[19,24],"accuracy":[43,48]},
+        "guandao": {"damage":[63,68],"accuracy":[35,40]},
+        "handbag": {"damage":[67,72],"accuracy":[63,68]},
+        "ice pick": {"damage":[51,56],"accuracy":[60,65]},
+        "kama": {"damage":[35,40],"accuracy":[55,60]},
+        "katana": {"damage":[52,57],"accuracy":[55,60]},
+        "knuckle dusters": {"damage":[11,16],"accuracy":[62,67]},
+        "kodachi": {"damage":[62,67],"accuracy":[56,61]},
+        "leather bullwhip": {"damage":[27,32],"accuracy":[52,57]},
+        "macana": {"damage":[57,62],"accuracy":[65,70]},
+        "metal nunchakus": {"damage":[61,66],"accuracy":[60,65]},
+        "naval cutlass": {"damage":[64,69],"accuracy":[52,57]},
+        "ninja claws": {"damage":[39,44],"accuracy":[51,56]},
+        "pillow": {"damage":[1,5.3],"accuracy":[63,68]},
+        "sai": {"damage":[29,34],"accuracy":[52,57]},
+        "samurai sword": {"damage":[58,63],"accuracy":[52,57]},
+        "spear": {"damage":[38,43],"accuracy":[48,53]},
+        "swiss army knife": {"damage":[23,28],"accuracy":[52,57]},
+        "twin tiger hooks": {"damage":[50,55],"accuracy":[53,58]},
+        "wooden nunchaku": {"damage":[22,27],"accuracy":[59,64]},
+        "wushu double axes": {"damage":[53,58],"accuracy":[51,56]},
+        "combat boots": {"armor":[38.0,43.0]},
+        "combat gloves": {"armor":[38.0,43.0]},
+        "combat helmet": {"armor":[38.0,43.0]},
+        "combat pants": {"armor":[38.0,43.0]},
+        "combat vest": {"armor":[38.0,43.0]},
+        "construction helmet": {"armor":[30.0,35.0]},
+        "flak jacket": {"armor":[30.0,35.0]},
+        "flexible body armor": {"armor":[42.0,47.0]},
+        "kevlar gloves": {"armor":[32.0,37.0]},
+        "liquid body armor": {"armor":[40.0,45.0]},
+        "outer tactical vest": {"armor":[36.0,41.0]},
+        "safety boots": {"armor":[30.0,35.0]},
+        "wwii helmet": {"armor":[34.0,39.0]}
+    });
     const state = {
         opts: { ...DEFAULTS }, key: "", epoch: 0, queue: Promise.resolve(), writes: Promise.resolve(),
         catalogs: new Map(), details: new Map(), inventories: new Map(), equipment: [],
@@ -104,7 +185,9 @@
         progress: "", notice: "", autoOpened: false, alive: true, requestAbort: new AbortController(),
         previousFocus: null, scanned: 0, loaded: 0, lastReferences: "", fallbackStorage: false,
         rowCandidates: 0, lastRowResolution: "", lastLayout: "", layoutFrame: 0,
-        mode: pageMode(), hiddenCount: 0, resetFilters: null, tempToggle: null, listingData: new Map(), listingIds: new Map(), observedFetch: false
+        mode: pageMode(), hiddenCount: 0, resetFilters: null, tempToggle: null, listingData: new Map(), listingIds: new Map(), observedFetch: false,
+        filterSlots: new Set(), compactLists: new Set(), sliderStates: new Map(), syncingSliders: false,
+        sliderStatus: "", lastSliderStatus: "", referenceSerial: 0
     };
 
     const number = value => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
@@ -176,6 +259,27 @@
         return o;
     }
     function saveOptions() { const snapshot = structuredCopy(state.opts); state.writes = state.writes.then(() => writeStore("options", snapshot)); }
+    function savedReferences(value) {
+        const result = new Map();
+        for (const pair of Array.isArray(value) ? value : []) {
+            if (!Array.isArray(pair) || !GROUPS.includes(pair[0])) continue;
+            const id = uidOf(pair[1]?.id), uid = uidOf(pair[1]?.uid);
+            if (id && (uid || pair[0] === "Temporary")) result.set(pair[0], { id, uid });
+        }
+        return result;
+    }
+    function saveReferences() {
+        state.referenceSerial++;
+        const snapshot = [...state.pins].map(([group, pin]) => [group, { id: pin.id, uid: pin.uid }]);
+        state.writes = state.writes.then(() => writeStore("references", snapshot));
+    }
+    async function reloadReferences() {
+        const serial = state.referenceSerial;
+        await state.writes;
+        const value = await readStore("references", []);
+        if (serial !== state.referenceSerial) return;
+        state.pins = savedReferences(value); schedule();
+    }
     function structuredCopy(value) { return JSON.parse(JSON.stringify(value)); }
     async function saveCache() {
         const value = { schema: 1, catalogs: [...state.catalogs], details: [...state.details].slice(-4000), inventories: [...state.inventories] };
@@ -336,8 +440,40 @@
             damage: number(s.damage), accuracy: number(s.accuracy), armor: number(s.armor), quality: number(s.quality),
             bonuses: Array.isArray(raw.bonuses) ? raw.bonuses : [], at };
     }
+    function isRatingRange(value) {
+        return Boolean(value && typeof value === "object" && number(value.min) !== null && number(value.max) !== null && value.min >= 0 && value.min <= value.max);
+    }
+    function ratingText(value) { return isRatingRange(value) ? fmt(value.min) + "-" + fmt(value.max) : fmt(value); }
+    function abroadStats(model, item) {
+        if (!item || !["Weapon", "Armor"].includes(item.type)) return null;
+        const known = ABROAD_RANGES[clean(item.name).toLowerCase()];
+        const values = { damage: new Set(), accuracy: new Set(), armor: new Set() };
+        for (const entry of model.row.querySelectorAll('[class*="properties__"] [class*="property__"],[class*="infoBonuses__"] [class*="container__"]')) {
+            if (owned(entry)) continue;
+            const value = entry.querySelector('[class*="value__"]') || entry.querySelector("span"), icon = entry.querySelector('i,[class*="icon__"]');
+            if (!value) continue;
+            const label = clean([value.getAttribute("aria-label"), entry.getAttribute("aria-label"), icon?.getAttribute("aria-label"), icon?.className, icon?.getAttribute("title")].filter(Boolean).join(" ")).toLowerCase();
+            const keys = ["damage", "accuracy", "armor"].filter(key => new RegExp(key === "armor" ? "\\b(?:armor|armour|defen[cs]e)\\b" : "\\b" + key + "\\b").test(label));
+            const match = clean(value.textContent).match(/^(\d+(?:\.\d+)?)\s*(?:-|–|to)\s*(\d+(?:\.\d+)?)$/);
+            if (keys.length === 1 && match && Number(match[1]) <= Number(match[2])) values[keys[0]].add(JSON.stringify([Number(match[1]), Number(match[2])]));
+        }
+        const record = { id: model.id, uid: "", damage: null, accuracy: null, armor: null, bonuses: [], at: 0, stale: false, shopRange: true, source: "Torn Wiki overseas shop range (verified 2026-10-18); individual roll unknown" };
+        for (const key of Object.keys(values)) {
+            let bounds = null;
+            if (values[key].size === 1) { bounds = JSON.parse([...values[key]][0]); record.source = "Displayed overseas shop range; individual roll unknown"; }
+            else if (!values[key].size && known?.[key]) {
+                const minimum = number(item.details?.base_stats?.[key]);
+                // A changed official catalog minimum invalidates the bundled
+                // range. Never guess a new maximum by adding a fixed amount.
+                if (minimum === null || minimum === known[key][0]) bounds = known[key];
+            }
+            if (bounds) record[key] = { min: bounds[0], max: bounds[1] };
+        }
+        return [record.damage, record.accuracy, record.armor].some(isRatingRange) ? record : null;
+    }
     function statsFor(model) {
         const catalog = catalogEntry(model.id);
+        if (model.abroad && !model.uid && groupOf(catalog) !== "Temporary") return abroadStats(model, catalog);
         if (model.shopping && groupOf(catalog) !== "Temporary") {
             const viewed = model.listingStats || (model.uid && state.listingData.get(model.id + ":" + model.uid));
             if (fresh(viewed, TTL.detail)) {
@@ -477,7 +613,7 @@
         if (accepted) { log("Native listings observed", { surface: context.mode, accepted }); schedule(); }
     }
     function installListingObserver() {
-        if (state.mode === "inventory") return;
+        if (state.mode === "inventory" || state.mode === "abroad") return;
         // Observe only listing responses the page already requests. No extra
         // authenticated site requests, injected scripts, or buy actions.
         try {
@@ -540,6 +676,10 @@
     }
     function shoppingRow(node) {
         if (!(node instanceof Element) || owned(node)) return null;
+        if (state.mode === "abroad") {
+            const row = node.closest(ABROAD_ROWS);
+            return row && state.root?.contains(row) ? row : null;
+        }
         const native = node.closest(SHOP_NATIVE_ROWS), row = native || node.closest('[data-listing-id],[data-bazaar-id]');
         if (!row || !state.root?.contains(row)) return null;
         if (row.matches("a,button,input,select,option,label") || (!native && row.matches('[role="button"]'))) return null;
@@ -550,10 +690,14 @@
     function rowVisible(row) {
         // Brief synchronous removal lets native filters remain authoritative.
         // This private attribute is deliberately outside the observer filter.
-        const hidden = row.getAttribute("data-tw-ic-filtered");
-        if (hidden !== null) row.removeAttribute("data-tw-ic-filtered");
+        const removed = [];
+        for (let node = row; node && node !== state.root; node = node.parentElement) {
+            for (const attr of ["data-tw-ic-filtered", "data-tw-ic-filter-slot"]) if (node.hasAttribute(attr)) {
+                removed.push([node, attr, node.getAttribute(attr)]); node.removeAttribute(attr);
+            }
+        }
         const visible = row.getClientRects().length > 0 && getComputedStyle(row).visibility !== "hidden";
-        if (hidden !== null) row.setAttribute("data-tw-ic-filtered", hidden);
+        for (const [node, attr, value] of removed) node.setAttribute(attr, value);
         return visible;
     }
     function visibleListingStats(row, id, uid) {
@@ -589,7 +733,7 @@
             if (match) idSet.add(match[1]);
         }
         for (const raw of objects) {
-            const id = uidOf(raw.itemID || raw.itemId || raw.item_id); if (id) idSet.add(id);
+            const id = uidOf(raw.itemID || raw.itemId || raw.item_id || (state.mode === "abroad" ? raw.ID : "")); if (id) idSet.add(id);
             const copy = raw.item_details || raw.itemDetails || raw;
             const uid = uidOf(copy.uid || copy.UID || raw.armoryID || raw.armouryID || raw.armoryId || raw.itemUid); if (uid) uidSet.add(uid);
         }
@@ -617,7 +761,7 @@
         }
         const listingStats = records[0] || null;
         if (listingStats?.uid) rememberListing(listingStats, listingScope());
-        return { id, uid, weak: "", name: catalog?.name || "Item " + id, group: groupOf(catalog), row, equipped: false, listingStats, shopping: true };
+        return { id, uid, weak: "", name: catalog?.name || "Item " + id, group: groupOf(catalog), row, equipped: false, listingStats, shopping: true, abroad: state.mode === "abroad" };
     }
     function nameHost(row) {
         // Mount only inside this item's name area. The v1.0.5 ownership check
@@ -627,6 +771,7 @@
             !node.closest('a,button,label,[role="button"],[contenteditable="true"]')) || null;
     }
     function rowHost(row, model) {
+        if (model.abroad) return row.querySelector('[class*="itemName__"],[data-tt-content-type="name"]') || row.querySelector('[class*="row__"]') || row;
         if (model.shopping) return row;
         if (state.opts.layout === "inline") {
             const host = nameHost(row);
@@ -666,7 +811,7 @@
         // mutations must remain visible to the inventory observer.
         const inline = state.opts.layout === "inline" && host !== row && host === nameHost(row);
         const mode = inline ? "inline" : host === row ? "footer" : "cell";
-        inlineClasses(row, inline ? host : null);
+        inlineClasses(row, inline || model.abroad ? host : null);
         if (row.getAttribute("data-tw-ic-mount") !== mode) row.setAttribute("data-tw-ic-mount", mode);
         if (wrap.parentElement !== host) host.appendChild(wrap);
     }
@@ -688,6 +833,8 @@
     function attachRoot(root) {
         if (state.root === root) return;
         if (state.inventoryObserver) state.inventoryObserver.disconnect();
+        clearFilterLayout();
+        restoreMarketSliders();
         if (state.root) for (const row of state.root.querySelectorAll("." + P + "annotated,[data-tw-ic-filtered]")) releaseRow(row);
         state.root = root;
         if (!root) return;
@@ -719,7 +866,14 @@
         return result;
     }
     function references(models) {
-        if (state.mode !== "inventory") return equippedReferences(models);
+        if (state.mode !== "inventory") {
+            const result = equippedReferences(models);
+            if (state.mode === "market") for (const [group, pin] of state.pins) {
+                const item = catalogEntry(pin.id);
+                if (groupOf(item) === group) result.set(group, { ...pin, group, name: item.name, referenceSource: "Chosen in inventory" });
+            }
+            return result;
+        }
         const result = new Map();
         for (const group of GROUPS) {
             const pin = state.pins.get(group);
@@ -727,7 +881,7 @@
                 const visible = models.find(m => pin.uid ? m.uid === pin.uid && m.id === pin.id : m.id === pin.id && m.group === "Temporary");
                 if (visible) { result.set(group, { ...visible, referenceSource: "Chosen" }); continue; }
                 // Never retain a manual pin for an item no longer in the visible list.
-                if (models.some(m => m.group === group)) state.pins.delete(group);
+                if (models.some(m => m.group === group)) { state.pins.delete(group); saveReferences(); }
             }
             if (state.opts.referenceMode === "selected") continue;
             const marked = [...new Map(models.filter(m => m.group === group && m.equipped).map(m => [m.uid ? m.id + ":" + m.uid : m.row, m])).values()];
@@ -762,16 +916,139 @@
         return reasons;
     }
     function applyFilters(models) {
-        const refs = equippedReferences(models); let hidden = 0;
+        const refs = state.mode === "market" ? references(models) : equippedReferences(models); let hidden = 0;
+        clearFilterLayout();
         for (const model of models) {
             const reasons = lowerReasons(model, refs.get(model.group));
-            if (reasons.length) { model.row.setAttribute("data-tw-ic-filtered", reasons.join(",")); hidden++; }
+            if (reasons.length) {
+                model.row.setAttribute("data-tw-ic-filtered", reasons.join(",")); hidden++;
+                const slot = marketSlot(model.row);
+                if (slot !== model.row) { slot.setAttribute("data-tw-ic-filter-slot", ""); state.filterSlots.add(slot); }
+            }
             else if (model.row.hasAttribute("data-tw-ic-filtered")) model.row.removeAttribute("data-tw-ic-filtered");
+            if (state.opts.enabled && FILTER_KEYS.some(key => state.opts[key]) && state.mode === "market" && model.row.matches(MARKET_TILES)) {
+                const slot = marketSlot(model.row), list = slot.parentElement;
+                if (list?.matches('[class*="itemList__"]')) {
+                    list.setAttribute("data-tw-ic-compact", ""); state.compactLists.add(list);
+                    slot.setAttribute("data-tw-ic-grid-slot", "");
+                }
+            }
         }
         state.hiddenCount = hidden;
         if (state.resetFilters) state.resetFilters.hidden = !FILTER_KEYS.some(key => state.opts[key]);
         if (state.tempToggle) state.tempToggle.hidden = !models.some(model => model.group === "Temporary");
         syncTempButtons();
+        syncMarketSliders(models, refs);
+    }
+    function clearFilterLayout() {
+        for (const slot of state.filterSlots) slot.removeAttribute("data-tw-ic-filter-slot");
+        state.filterSlots.clear();
+        for (const list of state.compactLists) {
+            list.removeAttribute("data-tw-ic-compact");
+            for (const slot of list.children) slot.removeAttribute("data-tw-ic-grid-slot");
+        }
+        state.compactLists.clear();
+    }
+    function marketSlot(row) {
+        if (state.mode !== "market") return row;
+        // A tile's enclosing LI is the grid cell. Hiding only the inner DIV
+        // leaves an empty cell. Never collapse a container of multiple items.
+        for (let slot = row; slot && slot !== state.root; slot = slot.parentElement) {
+            if (slot.parentElement?.matches('[class*="itemList__"],[class*="sellerList__"]')) {
+                if (slot.querySelectorAll(MARKET_TILES).length <= (slot.matches(MARKET_TILES) ? 0 : 1)) return slot;
+                return row;
+            }
+            if (slot !== row && slot.matches(SHOP_ROWS)) break;
+        }
+        return row;
+    }
+    function marketGroup(models) {
+        const id = marketItemId();
+        if (id) return groupOf(catalogEntry(id));
+        const query = new URLSearchParams(location.search), hash = new URLSearchParams(location.hash.replace(/^#\/?/, ""));
+        const category = clean(hash.get("categoryName") || query.get("categoryName"));
+        const group = GROUPS.find(g => g.toLowerCase() === category.toLowerCase());
+        if (group) return group;
+        // Armor/category searches can mix slots with different baselines.
+        // Do not apply one slot's minimum globally to the others.
+        return "";
+    }
+    function marketSliderControls() {
+        if (state.mode !== "market" || !state.root) return [];
+        const result = [];
+        for (const host of state.root.querySelectorAll('[class*="rangeSlider"]')) {
+            if (owned(host) || host.closest('[data-aon-brf]')) continue;
+            const inputs = [...host.querySelectorAll('input[type="range"]')];
+            const low = inputs.find(n => /sliderMin/.test(n.className));
+            const high = inputs.find(n => /sliderMax/.test(n.className));
+            if (!low || !high || low.disabled || high.disabled) continue;
+            const label = clean(host.querySelector('[class*="leftText"]')?.textContent || host.getAttribute("aria-label") || low.getAttribute("aria-label")).toLowerCase();
+            const keys = ["damage", "accuracy", "armor", "coverage"].filter(k => new RegExp(k === "armor" ? "\\b(?:armor|armour|defen[cs]e)\\b" : "\\b" + k + "\\b").test(label));
+            if (keys.length === 1) result.push({ host, low, high, key: keys[0] });
+        }
+        return result;
+    }
+    function setNativeRange(input, value) {
+        const view = input.ownerDocument.defaultView;
+        const setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, "value")?.set;
+        if (!setter) return false;
+        state.syncingSliders = true;
+        try {
+            setter.call(input, String(value));
+            input.dispatchEvent(new view.Event("input", { bubbles: true }));
+            input.dispatchEvent(new view.Event("change", { bubbles: true }));
+            return Math.abs(Number(input.value) - value) < 0.000001;
+        } finally { state.syncingSliders = false; }
+    }
+    function restoreMarketSliders(keep = new Set()) {
+        for (const [input, entry] of state.sliderStates) {
+            if (keep.has(input) && input.isConnected) continue;
+            state.sliderStates.delete(input);
+            // Leave a user's later manual refinement intact.
+            if (input.isConnected && entry.applied !== null && Number(input.value) === entry.applied) setNativeRange(input, entry.before);
+        }
+    }
+    function syncMarketSliders(models, refs) {
+        const controls = marketSliderControls(), group = marketGroup(models), ref = refs.get(group), base = ref && statsFor(ref);
+        const active = new Set(), notes = [];
+        const filter = { damage: "hideLowerDamage", accuracy: "hideLowerAccuracy", armor: "hideLowerArmor", coverage: "hideLowerCoverage" };
+        const armor = Object.hasOwn(SLOT_AREA, group), scope = "market:" + marketItemId() + ":" + group;
+        for (const control of controls) {
+            const { low, high, key } = control;
+            if (!low.isConnected || !state.opts.enabled || !state.opts[filter[key]] || !group || !ref) continue;
+            if ((key === "armor" || key === "coverage") !== armor || (key === "accuracy" && group === "Temporary")) continue;
+            // A global native damage minimum would also discard protected
+            // temporary effects before the local override could keep them.
+            if (group === "Temporary" && state.opts.keepTempEffects) continue;
+            const area = state.opts.coverageArea === "slot" ? SLOT_AREA[group] : state.opts.coverageArea;
+            const target = key === "coverage" ? coverage(catalogEntry(ref.id), area) : base && !base.stale ? number(base[key]) : null;
+            if (target === null) continue;
+            const min = number(low.getAttribute("min")) ?? 0, max = number(low.getAttribute("max")) ?? 100;
+            const step = low.step === "any" ? 0 : number(low.getAttribute("step")) || 1;
+            // Floor to Torn's supported step so equal fractional ratings are
+            // not excluded by rounding upward. Local filtering stays exact.
+            const wanted = Number((step ? min + Math.floor((target - min) / step + 1e-7) * step : target).toFixed(6));
+            if (wanted < min || wanted > max || wanted > Number(high.value)) continue;
+            const previous = state.sliderStates.get(low);
+            if (previous && previous.scope !== scope) restoreMarketSliders(new Set([...state.sliderStates.keys()].filter(n => n !== low)));
+            let entry = state.sliderStates.get(low);
+            const changed = !entry || entry.wanted !== wanted;
+            if (!entry) { entry = { scope, before: Number(low.value), applied: null, wanted, failed: false }; state.sliderStates.set(low, entry); }
+            active.add(low);
+            if (changed) { entry.wanted = wanted; entry.failed = false; }
+            if (!entry.failed && (changed || Number(low.value) < wanted)) {
+                const already = Number(low.value) === wanted;
+                if (!already && !setNativeRange(low, wanted)) entry.failed = true;
+                if (!already && !entry.failed) entry.applied = wanted;
+            }
+            notes.push((key === "armor" ? "AR" : key === "accuracy" ? "A" : key === "damage" ? "D" : "Coverage") + " ≥ " + fmt(target) + (entry.failed ? " (local filter)" : wanted !== target ? " (slider " + fmt(wanted) + ")" : ""));
+        }
+        restoreMarketSliders(active);
+        state.sliderStatus = notes.length ? "Market minimums: " + notes.join(" · ") : "";
+        if (state.sliderStatus !== state.lastSliderStatus) {
+            state.lastSliderStatus = state.sliderStatus;
+            log("Market slider minimums", { group, controls: controls.length, active: active.size, summary: state.sliderStatus });
+        }
     }
     function resetFilters() {
         for (const key of FILTER_KEYS) state.opts[key] = false;
@@ -803,6 +1080,14 @@
     }
     function sameItem(a, b) { return Boolean(a && b && (a.uid && b.uid ? a.uid === b.uid && a.id === b.id : a.group === "Temporary" && b.group === "Temporary" && a.id === b.id)); }
     function compare(a, b) {
+        if (isRatingRange(a)) {
+            if (number(b) === null) return { symbol: "?", cls: "unknown", text: "comparison unavailable" };
+            const min = compare(a.min, b), max = compare(a.max, b);
+            if (min.cls === "up") return { symbol: "↑", cls: "up", text: "entire shop range is higher" };
+            if (max.cls === "down") return { symbol: "↓", cls: "down", text: "entire shop range is lower" };
+            if (min.cls === "equal" && max.cls === "equal") return { symbol: "=", cls: "equal", text: "equal" };
+            return { symbol: "↕", cls: "equal", text: "shop range overlaps the reference; individual roll unknown" };
+        }
         if (number(a) === null || number(b) === null) return { symbol: "?", cls: "unknown", text: "comparison unavailable" };
         const delta = Math.round((a - b) * 100) / 100;
         return delta > 0 ? { symbol: "↑", cls: "up", text: "higher", delta } : delta < 0 ? { symbol: "↓", cls: "down", text: "lower", delta } : { symbol: "=", cls: "equal", text: "equal", delta: 0 };
@@ -955,7 +1240,7 @@
     }
     function currentModels() {
         if (!state.root) return [];
-        const candidates = Array.from(state.root.querySelectorAll(state.mode === "inventory" ? ROWS : SHOP_ROWS)).filter(n => !owned(n));
+        const candidates = Array.from(state.root.querySelectorAll(state.mode === "inventory" ? ROWS : state.mode === "abroad" ? ABROAD_ROWS : SHOP_ROWS)).filter(n => !owned(n));
         state.rowCandidates = candidates.length;
         const rows = new Set(candidates.map(itemOwner).filter(row => row && state.root.contains(row)));
         // Only resolved item owners participate here. Nested action LIs have
@@ -1051,7 +1336,8 @@
         if (document.getElementById(P + "styles")) return;
         const node = el("style"); node.id = P + "styles"; node.setAttribute("data-tw-ic-owned", "style");
         node.textContent = `
-        [data-tw-ic-filtered]{display:none!important}
+        [data-tw-ic-filtered],[data-tw-ic-filter-slot]{display:none!important}
+        [data-tw-ic-compact]>[data-tw-ic-grid-slot]{clear:none!important;grid-column:auto!important;grid-row:auto!important;height:auto!important;max-height:none!important}
         .${P}toolbar [hidden]{display:none!important}
         /* Both layouts stay within the resolved native inventory row. */
         .${P}annotated{height:auto!important;max-height:none!important;flex-wrap:wrap!important}
@@ -1147,10 +1433,10 @@
     }
     function metric(label, value, baseline, percent = false) {
         const node = el("span", null, P + "metric"); const c = compare(value, baseline);
-        node.append(el("span", label + (state.opts.showValues ? " " + fmt(value) + (percent && number(value) !== null ? "%" : "") : "")));
+        node.append(el("span", label + (state.opts.showValues ? " " + ratingText(value) + (percent && number(value) !== null ? "%" : "") : "")));
         const arrow = el("span", c.symbol, P + "arrow " + P + c.cls); arrow.setAttribute("aria-hidden", "true"); node.append(arrow);
         if (state.opts.showDeltas && c.delta !== undefined && c.delta !== 0) node.append(el("small", (c.delta > 0 ? "+" : "") + fmt(c.delta), P + "delta"));
-        node.setAttribute("aria-label", label + " " + fmt(value) + (percent ? " percent" : "") + ", " + c.text + (number(baseline) !== null ? " than " + fmt(baseline) : ""));
+        node.setAttribute("aria-label", label + " " + ratingText(value) + (percent ? " percent" : "") + ", " + c.text + (number(baseline) !== null ? " than " + fmt(baseline) : ""));
         return node;
     }
     function renderRow(model, ref) {
@@ -1189,7 +1475,8 @@
             small.append(el("span", "RoF " + rate.min + (rate.min !== rate.max ? "-" + rate.max : "")), el("span", c.symbol, P + "arrow " + P + c.cls));
             small.title = c.text + "; unmodified rounds per turn. Tap for details."; chip.append(small);
         }
-        if (!actual || actual.stale || !ref) chip.append(el("small", !actual ? (model.uid ? "Stats pending" : "UID needed") : actual.stale ? "Cached stats" : model.shopping ? "No equipped item in this slot" : "Choose reference", P + "muted"));
+        if (actual?.shopRange) chip.append(el("small", "Shop range · roll unknown", P + "muted"));
+        if (!actual || actual.stale || !ref) chip.append(el("small", !actual ? (model.uid ? "Stats pending" : model.abroad ? "Shop range unavailable" : "UID needed") : actual.stale ? "Cached stats" : model.shopping ? "No equipped item in this slot" : "Choose reference", P + "muted"));
         chip.title = model.name + (ref ? " vs " + ref.name : ": no reference yet") + (model.shopping ? ". Tap for comparison details." : ". Tap for details or choose a reference.");
         chip.setAttribute("aria-label", chip.title); wrap.append(chip);
     }
@@ -1197,7 +1484,9 @@
         if (!state.alive || !document.body) return;
         state.mode = pageMode();
         if (!state.mode) { attachRoot(null); state.toolbar?.remove(); return; }
-        styles(); attachRoot(findRoot()); ensureToolbar();
+        styles(); attachRoot(findRoot());
+        if (state.mode === "abroad" && !state.root) { state.toolbar?.remove(); return; }
+        ensureToolbar();
         const models = currentModels(); state.rows = models;
         const liveRows = new Set(models.map(m => m.row));
         if (state.root) for (const row of state.root.querySelectorAll("." + P + "annotated")) if (!liveRows.has(row)) releaseRow(row);
@@ -1211,7 +1500,7 @@
         for (const m of models) renderRow(m, refs.get(m.group));
         applyFilters(models);
         const info = !state.key ? "Tap ⚙ to add a minimal-access Torn API key" : state.blocked || state.progress || state.notice ||
-            state.loaded + "/" + state.scanned + " items have stats · " + state.hiddenCount + " hidden · ↑ higher · ↓ lower · = equal · tap stats for details";
+            state.loaded + "/" + state.scanned + " items have stats · " + state.hiddenCount + " hidden · ↑ higher · ↓ lower · = equal · tap stats for details" + (state.sliderStatus ? " · " + state.sliderStatus : "");
         if (state.statusText.textContent !== info) state.statusText.textContent = info;
         const resolution = JSON.stringify([state.rowCandidates, models.length, models.filter(m => m.uid).length]);
         if (resolution !== state.lastRowResolution) {
@@ -1268,6 +1557,7 @@
         }
         return { version: VERSION, surface: state.mode, identityNodes: state.rowCandidates, itemRows: rows.length,
             marketTiles: state.root?.querySelectorAll(MARKET_TILES).length || 0,
+            collapsedSlots: state.filterSlots.size, nativeSliderControls: marketSliderControls().length, sliderMinimums: state.sliderStatus,
             inventoryBox: box(state.root), outside, outsideInventory, wrongOwner, squeezed, duplicates, missing, samples };
     }
     function checkLayoutSoon() {
@@ -1320,10 +1610,10 @@
         const input = el("input"); input.type = "checkbox"; input.checked = state.opts[key];
         input.addEventListener("change", () => { state.opts[key] = input.checked; saveOptions(); schedule(); }); container.append(field(label, input));
     }
-    function clearReferences() { state.pins.clear(); schedule(); log("Manual references cleared"); }
+    function clearReferences() { state.pins.clear(); saveReferences(); schedule(); log("Manual references cleared"); }
     function setReference(model) {
         if (!model.group || (!model.uid && model.group !== "Temporary")) { state.notice = "An exact item UID is needed before using this item as reference."; schedule(); return; }
-        state.pins.set(model.group, { id: model.id, uid: model.uid }); log("Reference chosen", { group: model.group, itemId: model.id, uid: model.uid || "stack" }); schedule(); closeModal();
+        state.pins.set(model.group, { id: model.id, uid: model.uid }); saveReferences(); log("Reference chosen", { group: model.group, itemId: model.id, uid: model.uid || "stack" }); schedule(); closeModal();
     }
     async function refresh(force = false) {
         if (!state.key) { openSettings(); return; }
@@ -1340,7 +1630,7 @@
         state.epoch++; state.requestAbort.abort(); state.requestAbort = new AbortController();
         state.key = key; state.blocked = ""; state.blockedUntil = 0; state.notice = "";
         state.equipment = []; state.equipmentAt = 0; state.equipmentFailedAt = 0; state.equipmentWanted = true;
-        state.inventories.clear(); state.details.clear(); state.pins.clear(); state.failures.clear(); state.catalogAttempts.clear();
+        state.inventories.clear(); state.details.clear(); state.pins.clear(); saveReferences(); state.failures.clear(); state.catalogAttempts.clear();
         await state.writes; await removeStore("cache");
         const saved = await writeStore("api-key", key);
         feedback.textContent = saved ? "Key saved. Loading stats; you can close settings." : "Key active for this page. Persistent storage is unavailable.";
@@ -1348,7 +1638,7 @@
     }
     function openSettings() {
         const panel = modal("Inventory Compare · " + VERSION);
-        panel.append(el("p", "Compare individual item ratings in inventory, the item market and bazaars. Market and bazaar listings always compare with your equipped weapon category or armor slot. Inventory also supports chosen references.", P + "muted"));
+        panel.append(el("p", "Compare inventory, item market, bazaar and overseas shop gear by weapon category or armor slot. Market arrows and filters use a chosen inventory reference when available, otherwise equipped gear. Bazaars and overseas shops use equipped gear.", P + "muted"));
         const credentials = el("div", null, P + "stack"); credentials.append(el("h3", "Torn API key"));
         const key = el("input"); key.type = "password"; key.maxLength = 16; key.autocomplete = "off"; key.spellcheck = false; key.setAttribute("aria-label", "16-character Torn API key");
         key.placeholder = state.key ? "Key saved. Enter a new key to replace it." : "16-character minimal-access key";
@@ -1357,7 +1647,7 @@
         keyActions.append(button("Save key", async function () { const value = key.value.trim(); key.value = ""; await setKey(value, feedback); }),
             button("Forget key", async () => {
                 state.epoch++; state.requestAbort.abort(); state.requestAbort = new AbortController(); state.key = "";
-                state.equipment = []; state.details.clear(); state.inventories.clear(); state.pins.clear(); state.blocked = "";
+                state.equipment = []; state.details.clear(); state.inventories.clear(); state.pins.clear(); saveReferences(); state.blocked = "";
                 await state.writes; await removeStore("api-key"); await removeStore("cache"); feedback.textContent = "Key and private cached data removed."; log("Key removed"); schedule();
             }), link("Create a minimal-access key", "https://www.torn.com/preferences.php#tab=api"));
         credentials.append(key, keyActions, feedback, el("small", state.fallbackStorage ? "This WebView uses session storage. Your key may need entering again after closing the session." : "The key is stored through the userscript manager and sent only to api.torn.com. It is never included in copied logs.")); panel.append(credentials);
@@ -1385,11 +1675,11 @@
         settingCheck(filters, "hideLowerAccuracy", "Hide lower accuracy");
         settingCheck(filters, "hideLowerArmor", "Hide lower armor rating");
         settingCheck(filters, "hideLowerCoverage", "Hide lower armor coverage");
-        filters.append(el("p", "These four filters apply in inventory, item market and bazaars. An item is hidden when any checked stat is lower than the matching equipped item. Equal or unavailable comparisons stay visible. Weapon filters do not affect armor, and armor filters do not affect weapons. Coverage uses the selected body area. Filters always use equipped gear, including when inventory comparisons use a chosen item.", P + "muted"),
+        filters.append(el("p", "An item is hidden when any checked stat is confirmed lower than its reference. Inventory, bazaar and overseas filters use equipped gear. Market filters use a saved chosen inventory reference when present. Equal, unknown and overlapping shop ranges remain visible. Armor compares within its slot; coverage uses the selected body area. Market cards close up after filtering. In a single category or item view, supported native stat sliders also follow the reference minimum; mixed armor slots and coverage without a native slider use local filtering. Unchecking restores the previous native minimum unless you changed it yourself.", P + "muted"),
             tempEffectButton(), el("small", "Turn ON to keep temporary debuffs, burning effects and self buffs visible through the filters. Damage-only explosives and decorative items continue to follow your filters. This override is saved separately and starts OFF."), button("Reset filters", resetFilters));
         panel.append(filters);
         panel.append(el("p", "D = intrinsic damage rating, not predicted HP damage. A = accuracy. AR = armor. C(area) = coverage of that body area. ↑ higher, ↓ lower, = equal, ? unavailable. RoF is the unmodified rounds-per-turn range, not attack speed; ↕ means mixed bounds. Player perks, ammo, weapon mods and combat circumstances can change outcomes.", P + "callout"));
-        panel.append(el("p", "Inventory API lists can be an hour old. Individual copies are matched only by UID. Missing UIDs are never assigned by name or row order. Expand an item's native information if its UID is unavailable, then refresh. Pins last for this page session.", P + "muted"));
+        panel.append(el("p", "Inventory API lists can be an hour old. Individual copies are matched only by UID. Missing UIDs are never assigned by name or row order. Chosen inventory references are saved across pages; Use equipped references clears them. Overseas shop ranges are labeled because the purchased copy's exact roll is usually unknown. ↕ indicates a range overlapping the reference. No roll is estimated from catalog base stats.", P + "muted"));
         panel.append(el("p", "Inventory comparisons sit beside the item name and wrap within its name area when needed. Choose the previous layout to put them below each inventory row. Market and bazaar comparisons stay within each listing. Arrow and effect icon sizes can be adjusted independently.", P + "muted"));
         panel.append(el("h3", "Weapon effect icons"));
         panel.append(el("p", "🔥 Burn · ⚡ Shock · ☠️ Poisoned · 🩸 Bleed / Laceration · ❄️ Freeze · 😵‍💫 Stun. Icons identify effects a weapon can apply; they do not mean an effect is guaranteed to trigger. Tap the comparison to see its effect labels and reported bonuses.", P + "muted"));
@@ -1410,17 +1700,18 @@
     function openDetails(model, ref) {
         const item = catalogEntry(model.id); const actual = statsFor(model); const base = ref && statsFor(ref);
         const panel = modal(model.name);
-        panel.append(el("p", (model.uid ? "UID " + model.uid : "No unique UID exposed in this row") + " · " + (model.group || "unknown slot"), P + "muted"));
+        panel.append(el("p", (model.uid ? "UID " + model.uid : model.abroad ? "Overseas shop item · individual roll unknown" : "No unique UID exposed in this row") + " · " + (model.group || "unknown slot"), P + "muted"));
         panel.append(el("p", ref ? "Compared with " + ref.name + (ref.uid ? " [" + ref.uid + "]" : "") + " · " + ref.referenceSource : model.shopping ? "No equipped reference is available in this category or armor slot." : "No reference is available in this slot. Choose an inventory item below.", P + "callout"));
         const t = el("table", null, P + "table"); tableRow(t, ["Rating", "This item", "Reference", "Change"], true);
         for (const [key, name] of model.group === "Temporary" ? [["damage", "Damage rating"]] : item && item.type === "Armor" ? [["armor", "Armor rating"]] : [["damage", "Damage rating"], ["accuracy", "Accuracy"]]) {
-            const a = actual && actual[key], b = base && base[key]; const c = compare(a, b); tableRow(t, [name, fmt(a), fmt(b), c.symbol + (c.delta !== undefined ? " " + (c.delta > 0 ? "+" : "") + fmt(c.delta) : "")]);
+            const a = actual && actual[key], b = base && base[key]; const c = compare(a, b); tableRow(t, [name, ratingText(a), ratingText(b), c.symbol + (c.delta !== undefined ? " " + (c.delta > 0 ? "+" : "") + fmt(c.delta) : "")]);
         }
         const rate = rof(item); const baseRate = ref && rof(catalogEntry(ref.id));
         if (rate) tableRow(t, ["RoF (rounds / turn)", rate.min + "-" + rate.max, baseRate ? baseRate.min + "-" + baseRate.max : "?", compareRoF(rate, baseRate).symbol]);
         panel.append(t);
         if (actual) panel.append(el("small", "Source: " + actual.source + (actual.at ? " · fetched " + new Date(actual.at).toLocaleString() : "") + (actual.stale ? " · cached, refresh pending" : "")));
-        else panel.append(el("p", model.uid ? "Individual stats are pending or unavailable. Check API status in settings and Refresh." : "Torn must expose this copy's UID before rolled stats can be shown. Expanding its native information can expose the UID. Copies are never guessed by their names or order.", P + "muted"));
+        else panel.append(el("p", model.uid ? "Individual stats are pending or unavailable. Check API status in settings and Refresh." : model.abroad ? "No verified shop range is available for this item. Its future individual roll is unknown. Known catalog coverage and effects can still be compared." : "Torn must expose this copy's UID before rolled stats can be shown. Expanding its native information can expose the UID. Copies are never guessed by their names or order.", P + "muted"));
+        if (actual?.shopRange) panel.append(el("p", "This is the shop item's possible ordinary stat range. The exact roll is determined when a copy is generated. ↑ means every value is higher than your equipped item; ↓ means every value is lower; ↕ means the range overlaps it. Coverage and temporary damage are fixed catalog values. Unknown ranges stay unavailable.", P + "callout"));
         if (model.group === "Temporary") {
             const e = effect(item); panel.append(el("p", e.symbol + " " + e.label, P + "callout")); panel.append(el("p", e.text));
             panel.append(el("p", "Displayed damage is the fixed item rating. It does not predict HP lost or compare the tactical value of buffs and debuffs.", P + "muted"));
@@ -1457,10 +1748,10 @@
         if (owned(event.target) || !(event.target instanceof Element) || !state.root || !state.root.contains(event.target)) return;
         const row = inventoryRow(event.target);
         if (row && state.opts.referenceMode === "selected" && !event.target.closest('a,button,input,select,label,[role="button"],.option,.option-wrap')) {
-            const model = readRow(row); if (model && model.group && (model.uid || model.group === "Temporary")) { state.pins.set(model.group, { id: model.id, uid: model.uid }); schedule(); }
+            const model = readRow(row); if (model && model.group && (model.uid || model.group === "Temporary")) { state.pins.set(model.group, { id: model.id, uid: model.uid }); saveReferences(); schedule(); }
         }
         const action = event.target.closest('.option-equip,.option-unequip,[data-action="equip"],[data-action="unequip"]');
-        if (action) { state.equipmentWanted = true; state.equipmentFailedAt = 0; state.pins.clear(); schedule(); }
+        if (action) { state.equipmentWanted = true; state.equipmentFailedAt = 0; state.pins.clear(); saveReferences(); schedule(); }
     }
     async function boot() {
         if (!document.documentElement) await new Promise(resolve => {
@@ -1468,8 +1759,9 @@
             observer.observe(document, { childList: true });
         });
         if (!marker.isConnected) (document.head || document.documentElement).appendChild(marker);
-        const [opts, key, cached] = await Promise.all([readStore("options", {}), readStore("api-key", ""), readStore("cache", null)]);
+        const [opts, key, cached, pins] = await Promise.all([readStore("options", {}), readStore("api-key", ""), readStore("cache", null), readStore("references", [])]);
         state.opts = sanitizeOptions(opts); state.key = typeof key === "string" && /^[A-Za-z0-9]{16}$/.test(key) ? key : "";
+        state.pins = savedReferences(pins);
         if (cached && cached.schema === 1) {
             for (const pair of Array.isArray(cached.catalogs) ? cached.catalogs : []) if (Array.isArray(pair) && pair[1] && Array.isArray(pair[1].items)) state.catalogs.set(pair[0], pair[1]);
             for (const pair of Array.isArray(cached.details) ? cached.details : []) if (Array.isArray(pair) && pair[1] && uidOf(pair[1].uid)) state.details.set(pair[0], pair[1]);
@@ -1477,6 +1769,14 @@
         }
         styles();
         document.addEventListener("click", nativeClick, true);
+        const sliderInput = event => {
+            if (state.syncingSliders || state.mode !== "market" || !(event.target instanceof HTMLInputElement) || event.target.type !== "range" || owned(event.target)) return;
+            const entry = state.sliderStates.get(event.target);
+            if (entry) { entry.before = Number(event.target.value); entry.applied = null; entry.failed = false; }
+            schedule();
+        };
+        document.addEventListener("input", sliderInput, true);
+        document.addEventListener("change", sliderInput, true);
         state.discovery = new MutationObserver(records => {
             if (!state.root || !state.root.isConnected || !state.toolbar || !state.toolbar.isConnected) { schedule(); return; }
             const roots = Object.values(ROOTS).join(",");
@@ -1486,8 +1786,8 @@
         window.addEventListener("pageshow", schedule);
         window.addEventListener("resize", schedule, { passive: true });
         window.addEventListener("hashchange", schedule);
-        window.addEventListener("focus", () => { if (Date.now() - state.equipmentAt > 120000) state.equipmentWanted = true; schedule(); });
-        document.addEventListener("visibilitychange", () => { if (!document.hidden) { if (Date.now() - state.equipmentAt > 120000) state.equipmentWanted = true; schedule(); } });
+        window.addEventListener("focus", () => { if (Date.now() - state.equipmentAt > 120000) state.equipmentWanted = true; void reloadReferences(); schedule(); });
+        document.addEventListener("visibilitychange", () => { if (!document.hidden) { if (Date.now() - state.equipmentAt > 120000) state.equipmentWanted = true; void reloadReferences(); schedule(); } });
         try {
             const register = typeof GM_registerMenuCommand === "function" ? GM_registerMenuCommand : typeof GM !== "undefined" && GM.registerMenuCommand ? GM.registerMenuCommand.bind(GM) : null;
             if (register) register("Inventory Compare settings", openSettings);
@@ -3595,4 +3895,4 @@ function initializeModularDebugger(scriptNamespace) {
 
     installListingObserver();
     void boot().catch(error => MyDebug.log({ event: "Startup failed", message: error.message }, "ERROR"));
-})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.1.1" } });
+})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.2.0" } });
