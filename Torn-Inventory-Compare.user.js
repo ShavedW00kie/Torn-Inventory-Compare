@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn-Inventory-Compare
 // @namespace    https://github.com/ShavedW00kie/
-// @version      1.1.0
+// @version      1.1.1
 // @description  Compare actual weapon and armor stats in inventory, item market and bazaars against matching equipped gear. Includes lower-stat filters, effects, coverage and diagnostics.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -59,7 +59,7 @@
     }
     if (!pageMode()) return;
     const MyDebug = initializeModularDebugger(GM_info.script.name);
-    const VERSION = "1.1.0";
+    const VERSION = "1.1.1";
     const P = "tw-ic-";
     if (document.getElementById(P + "active")) return;
     const marker = document.createElement("meta");
@@ -73,6 +73,7 @@
         showEffects: true, fontSize: 11, arrowSize: 18, effectSize: 22, layout: "inline",
         upColor: "#79e6a5", downColor: "#99d9ff",
         hideLowerDamage: false, hideLowerAccuracy: false, hideLowerArmor: false, hideLowerCoverage: false,
+        keepTempEffects: false,
         referenceMode: "equipped", coverageArea: "slot", armorSlots: {}
     });
     const GROUPS = ["Primary", "Secondary", "Melee", "Temporary", "head", "body", "hands", "legs", "feet", "fullbody"];
@@ -86,10 +87,11 @@
     const NATIVE_LISTS = "ul.items-cont,ol.items-cont,ul[id$='-items'],ol[id$='-items'],#all-items";
     const NATIVE_ROWS = NATIVE_LISTS.split(",").map(selector => selector + " > li").join(",");
     const ROWS = ITEM_MARKERS + "," + NATIVE_ROWS;
-    const SHOP_NATIVE_ROWS = '[class*="sellerList__"] > li,[class*="sellerRow__"],[class*="rowItems__"] > [class*="item__"],.items-list > li,.market-listing,.bazaar-item';
+    const MARKET_TILES = '[class*="itemTile__"]';
+    const SHOP_NATIVE_ROWS = MARKET_TILES + ',[class*="itemList__"] > li,[class*="sellerList__"] > li,[class*="sellerRow__"],[class*="rowItems__"] > [class*="item__"],.items-list > li,.market-listing,.bazaar-item';
     const SHOP_ROWS = SHOP_NATIVE_ROWS + ',[data-listing-id],[data-bazaar-id]';
     const ROOTS = { inventory: "div.items-wrap,.items-wrap,#all-items", market: "#item-market-root,#itemmarket,.item-market-wrap",
-        bazaar: '#bazaarroot,#bazaar-root,.bazaar-main-wrap,[class*="itemsContainner__"]' };
+        bazaar: '#bazaarRoot,#bazaarroot,#bazaar-root,.bazaar-main-wrap,[class*="itemsContainner__"]' };
     const FILTER_KEYS = ["hideLowerDamage", "hideLowerAccuracy", "hideLowerArmor", "hideLowerCoverage"];
     const state = {
         opts: { ...DEFAULTS }, key: "", epoch: 0, queue: Promise.resolve(), writes: Promise.resolve(),
@@ -102,7 +104,7 @@
         progress: "", notice: "", autoOpened: false, alive: true, requestAbort: new AbortController(),
         previousFocus: null, scanned: 0, loaded: 0, lastReferences: "", fallbackStorage: false,
         rowCandidates: 0, lastRowResolution: "", lastLayout: "", layoutFrame: 0,
-        mode: pageMode(), hiddenCount: 0, resetFilters: null, listingData: new Map(), listingIds: new Map(), observedFetch: false
+        mode: pageMode(), hiddenCount: 0, resetFilters: null, tempToggle: null, listingData: new Map(), listingIds: new Map(), observedFetch: false
     };
 
     const number = value => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
@@ -160,7 +162,7 @@
     function sanitizeOptions(input) {
         const o = { ...DEFAULTS };
         if (!input || typeof input !== "object") return o;
-        for (const k of ["enabled", "showValues", "showDeltas", "showRoF", "showEffects", ...FILTER_KEYS]) if (typeof input[k] === "boolean") o[k] = input[k];
+        for (const k of ["enabled", "showValues", "showDeltas", "showRoF", "showEffects", "keepTempEffects", ...FILTER_KEYS]) if (typeof input[k] === "boolean") o[k] = input[k];
         if (["equipped", "selected"].includes(input.referenceMode)) o.referenceMode = input.referenceMode;
         if (["slot", ...AREAS].includes(input.coverageArea)) o.coverageArea = input.coverageArea;
         o.fontSize = Math.max(9, Math.min(15, number(input.fontSize) || 11));
@@ -464,7 +466,7 @@
     }
     function observeListingResponse(data, context) {
         if (!data || typeof data !== "object") return;
-        const list = Array.isArray(data.list) ? data.list : Array.isArray(data.listings) ? data.listings : data.itemmarket?.listings;
+        const list = Array.isArray(data.list) ? data.list : Array.isArray(data.listings) ? data.listings : Array.isArray(data.items) ? data.items : data.itemmarket?.listings;
         if (!Array.isArray(list)) return;
         let accepted = 0;
         for (const raw of list) {
@@ -487,7 +489,7 @@
                 try {
                     const url = new URL(typeof args[0] === "string" ? args[0] : args[0]?.url, location.href), step = url.searchParams.get("step");
                     if (url.origin === location.origin && ((url.pathname === "/bazaar.php" && step === "getBazaarItems") ||
-                        (url.pathname === "/page.php" && /^(?:imarket|itemmarket)$/i.test(url.searchParams.get("sid") || "") && step === "getListing"))) {
+                        (url.pathname === "/page.php" && /^(?:imarket|itemmarket)$/i.test(url.searchParams.get("sid") || "") && ["getListing", "getShopList", "searchItem"].includes(step)))) {
                         const mode = url.pathname === "/bazaar.php" ? "bazaar" : "market";
                         let body = args[1]?.body, id = uidOf(url.searchParams.get("itemID"));
                         if (typeof body === "string") { try { body = JSON.parse(body); } catch (_) { body = new URLSearchParams(body); } }
@@ -538,9 +540,9 @@
     }
     function shoppingRow(node) {
         if (!(node instanceof Element) || owned(node)) return null;
-        const row = node.closest(SHOP_NATIVE_ROWS) || node.closest('[data-listing-id],[data-bazaar-id]');
+        const native = node.closest(SHOP_NATIVE_ROWS), row = native || node.closest('[data-listing-id],[data-bazaar-id]');
         if (!row || !state.root?.contains(row)) return null;
-        if (row.matches('a,button,input,select,option,label,[role="button"]')) return null;
+        if (row.matches("a,button,input,select,option,label") || (!native && row.matches('[role="button"]'))) return null;
         const seller = row.closest('[class*="sellerList__"] > li');
         return seller || row;
     }
@@ -553,6 +555,26 @@
         const visible = row.getClientRects().length > 0 && getComputedStyle(row).visibility !== "hidden";
         if (hidden !== null) row.setAttribute("data-tw-ic-filtered", hidden);
         return visible;
+    }
+    function visibleListingStats(row, id, uid) {
+        // Read the values already printed on this individual tile. The typed
+        // property label identifies each metric; price, quality and list order
+        // never stand in for a rolled rating.
+        const values = { damage: new Set(), accuracy: new Set(), armor: new Set() };
+        const entries = row.querySelectorAll('[class*="properties__"] [class*="property__"],[class*="infoBonuses__"] [class*="container__"]');
+        for (const entry of entries) {
+            if (owned(entry)) continue;
+            const value = entry.querySelector('[class*="value__"]') || entry.querySelector("span"), icon = entry.querySelector('i,[class*="icon__"]');
+            if (!value || owned(value)) continue;
+            const label = clean([value.getAttribute("aria-label"), entry.getAttribute("aria-label"), icon?.getAttribute("aria-label"), icon?.getAttribute("class"), icon?.getAttribute("title")].filter(Boolean).join(" ")).toLowerCase();
+            const kinds = [/(?:damage|dmg)/.test(label) && "damage", /(?:accuracy|\bacc\b)/.test(label) && "accuracy", /(?:armou?r|defen[cs]e)/.test(label) && "armor"].filter(Boolean);
+            const text = clean(value.textContent);
+            if (kinds.length !== 1 || !/^\d+(?:\.\d+)?$/.test(text)) continue;
+            values[kinds[0]].add(Number(text));
+        }
+        const record = { id, uid, damage: null, accuracy: null, armor: null, quality: null, bonuses: [], at: Date.now(), source: "Visible listing stats" };
+        for (const key of Object.keys(values)) if (values[key].size === 1) record[key] = [...values[key]][0];
+        return hasRatings(record) ? record : null;
     }
     function readShoppingRow(row) {
         const objects = rowListingObjects(row), idSet = new Set(), uidSet = new Set(), listingIds = new Set();
@@ -589,6 +611,10 @@
         const id = [...idSet][0], uid = uidSet.size === 1 ? [...uidSet][0] : "", catalog = catalogEntry(id);
         // Multiple copy identities within one supposed card are ambiguous.
         records = uidSet.size > 1 ? [] : records.filter(r => r.id === id && (!r.uid || !uid || r.uid === uid) && hasRatings(r));
+        if (uidSet.size <= 1) {
+            const visible = visibleListingStats(row, id, uid);
+            if (visible) records.push(visible);
+        }
         const listingStats = records[0] || null;
         if (listingStats?.uid) rememberListing(listingStats, listingScope());
         return { id, uid, weak: "", name: catalog?.name || "Item " + id, group: groupOf(catalog), row, equipped: false, listingStats, shopping: true };
@@ -721,6 +747,7 @@
     function lowerReasons(model, ref) {
         if (!state.opts.enabled || !ref || !model.group || sameItem(model, ref)) return [];
         const item = catalogEntry(model.id), actual = statsFor(model), base = statsFor(ref), reasons = [];
+        if (state.opts.keepTempEffects && hasTemporaryStatus(item)) return reasons;
         const lower = (a, b) => compare(a, b).cls === "down";
         // Unavailable or expired copy ratings never remove an item from view.
         if (item?.type === "Weapon" && actual && base && !actual.stale && !base.stale) {
@@ -743,11 +770,36 @@
         }
         state.hiddenCount = hidden;
         if (state.resetFilters) state.resetFilters.hidden = !FILTER_KEYS.some(key => state.opts[key]);
+        if (state.tempToggle) state.tempToggle.hidden = !models.some(model => model.group === "Temporary");
+        syncTempButtons();
     }
     function resetFilters() {
         for (const key of FILTER_KEYS) state.opts[key] = false;
         saveOptions(); schedule();
         if (state.modal) openSettings();
+    }
+    function hasTemporaryStatus(item) {
+        if (groupOf(item) !== "Temporary") return false;
+        const value = effect(item);
+        if (["💥", "🎉", "·"].includes(value.symbol)) return false;
+        if (value.symbol !== "✦") return true;
+        return /(?:buff|debuff|stun|blind|smok|gas|maced|burn|poison|paraly|ensnar|strength|dexterity|defen[cs]e|speed|heal|life restoration)/i.test(value.text);
+    }
+    function syncTempButtons() {
+        const text = "Keep temporary effect items visible: " + (state.opts.keepTempEffects ? "ON" : "OFF");
+        for (const node of document.querySelectorAll("[data-tw-ic-temp-toggle]")) {
+            if (node.textContent !== text) node.textContent = text;
+            const pressed = String(state.opts.keepTempEffects);
+            if (node.getAttribute("aria-pressed") !== pressed) node.setAttribute("aria-pressed", pressed);
+        }
+    }
+    function tempEffectButton() {
+        const node = button("Keep temporary effect items visible: " + (state.opts.keepTempEffects ? "ON" : "OFF"), () => {
+            state.opts.keepTempEffects = !state.opts.keepTempEffects; saveOptions(); syncTempButtons(); schedule();
+        });
+        node.setAttribute("data-tw-ic-temp-toggle", ""); node.setAttribute("aria-pressed", String(state.opts.keepTempEffects));
+        node.title = "Let temporary status effects and self buffs pass through lower-stat filters.";
+        return node;
     }
     function sameItem(a, b) { return Boolean(a && b && (a.uid && b.uid ? a.uid === b.uid && a.id === b.id : a.group === "Temporary" && b.group === "Temporary" && a.id === b.id)); }
     function compare(a, b) {
@@ -1041,9 +1093,10 @@
         .${P}equal{color:#d5dce1!important}.` + P + `unknown{color:#c9c1a7!important}
         .${P}annotated .${P}wrap .${P}rof{font-size:.86em!important;opacity:.95}
         .${P}annotated .${P}wrap .${P}delta{font-size:.9em!important;opacity:.85}
-        .${P}toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:34px;margin:4px 0;
+        .${P}toolbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;min-height:34px;margin:4px 0;
           padding:2px 5px;box-sizing:border-box;color:#dbe6ed;background:#22292fd9;border-radius:5px;font:11px/1.3 Arial,sans-serif;clear:both}
-        .${P}toolbar>div{min-width:0;overflow-wrap:anywhere}
+        .${P}toolbar>div{flex:1 1 200px;min-width:0;overflow-wrap:anywhere}
+        .${P}toolbar>.${P}button{max-width:100%;white-space:normal}
         .${P}toolbar small{display:block;color:#b4c7d2;font-size:10px;overflow-wrap:anywhere}
         .${P}gear{flex-shrink:0;width:34px;min-height:32px;padding:0;border:1px solid #77828b;border-radius:6px;
           background:#222b31;color:#ebf7ff;font-size:21px;cursor:pointer;touch-action:manipulation}
@@ -1083,7 +1136,8 @@
             const text = el("div"); state.baselineText = el("span"); state.statusText = el("small"); text.append(state.baselineText, state.statusText);
             const gear = button("⚙", openSettings, P + "gear"); gear.title = "Inventory Compare settings"; gear.setAttribute("aria-label", "Open Inventory Compare settings");
             state.resetFilters = button("Reset filters", resetFilters); state.resetFilters.hidden = true;
-            bar.append(text, state.resetFilters, gear); state.toolbar = bar;
+            state.tempToggle = tempEffectButton(); state.tempToggle.hidden = true;
+            bar.append(text, state.resetFilters, state.tempToggle, gear); state.toolbar = bar;
         }
         const bar = state.toolbar;
         if (state.root && state.root.parentElement) {
@@ -1212,7 +1266,8 @@
                 outside: bad, outsideInventory: beyondInventory, wrongOwner: misplaced, squeezed: narrow
             });
         }
-        return { version: VERSION, identityNodes: state.rowCandidates, itemRows: rows.length,
+        return { version: VERSION, surface: state.mode, identityNodes: state.rowCandidates, itemRows: rows.length,
+            marketTiles: state.root?.querySelectorAll(MARKET_TILES).length || 0,
             inventoryBox: box(state.root), outside, outsideInventory, wrongOwner, squeezed, duplicates, missing, samples };
     }
     function checkLayoutSoon() {
@@ -1330,7 +1385,8 @@
         settingCheck(filters, "hideLowerAccuracy", "Hide lower accuracy");
         settingCheck(filters, "hideLowerArmor", "Hide lower armor rating");
         settingCheck(filters, "hideLowerCoverage", "Hide lower armor coverage");
-        filters.append(el("p", "These four filters apply in inventory, item market and bazaars. An item is hidden when any checked stat is lower than the matching equipped item. Equal or unavailable comparisons stay visible. Weapon filters do not affect armor, and armor filters do not affect weapons. Coverage uses the selected body area. Filters always use equipped gear, including when inventory comparisons use a chosen item.", P + "muted"), button("Reset filters", resetFilters));
+        filters.append(el("p", "These four filters apply in inventory, item market and bazaars. An item is hidden when any checked stat is lower than the matching equipped item. Equal or unavailable comparisons stay visible. Weapon filters do not affect armor, and armor filters do not affect weapons. Coverage uses the selected body area. Filters always use equipped gear, including when inventory comparisons use a chosen item.", P + "muted"),
+            tempEffectButton(), el("small", "Turn ON to keep temporary debuffs, burning effects and self buffs visible through the filters. Damage-only explosives and decorative items continue to follow your filters. This override is saved separately and starts OFF."), button("Reset filters", resetFilters));
         panel.append(filters);
         panel.append(el("p", "D = intrinsic damage rating, not predicted HP damage. A = accuracy. AR = armor. C(area) = coverage of that body area. ↑ higher, ↓ lower, = equal, ? unavailable. RoF is the unmodified rounds-per-turn range, not attack speed; ↕ means mixed bounds. Player perks, ammo, weapon mods and combat circumstances can change outcomes.", P + "callout"));
         panel.append(el("p", "Inventory API lists can be an hour old. Individual copies are matched only by UID. Missing UIDs are never assigned by name or row order. Expand an item's native information if its UID is unavailable, then refresh. Pins last for this page session.", P + "muted"));
@@ -3539,4 +3595,4 @@ function initializeModularDebugger(scriptNamespace) {
 
     installListingObserver();
     void boot().catch(error => MyDebug.log({ event: "Startup failed", message: error.message }, "ERROR"));
-})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.1.0" } });
+})(typeof GM_info !== "undefined" && GM_info && GM_info.script ? GM_info : { script: { name: "Torn-Inventory-Compare", version: "1.1.1" } });
